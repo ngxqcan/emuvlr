@@ -1069,6 +1069,40 @@ static const uint8_t FALLBACK_TOKEN[] = {
 };
 static const size_t FALLBACK_TOKEN_LEN = sizeof(FALLBACK_TOKEN);
 
+static std::vector<uint8_t> BuildExpandedDynamicFallbackToken(int hb_count) {
+  std::vector<uint8_t> token(FALLBACK_TOKEN, FALLBACK_TOKEN + FALLBACK_TOKEN_LEN);
+
+  // Protobuf field 15 (Tag 15, wire type 2 = 0x7A) for telemetry/padding extension
+  // Vary target size between 320B and 480B dynamically per heartbeat
+  size_t target_extra = 30 + ((hb_count * 17 + (size_t)rand()) % 150); // total size 323B to 473B
+  if (target_extra < 20) target_extra = 20;
+
+  token.push_back(0x7A); // Field 15, length-delimited wire type 2
+  if (target_extra <= 127) {
+    token.push_back(static_cast<uint8_t>(target_extra));
+  } else {
+    token.push_back(static_cast<uint8_t>((target_extra & 0x7F) | 0x80));
+    token.push_back(static_cast<uint8_t>(target_extra >> 7));
+  }
+
+  // Fill with dynamic non-zero telemetry mock bytes
+  for (size_t i = 0; i < target_extra; ++i) {
+    uint8_t b = static_cast<uint8_t>((hb_count * 31 + i * 13 + rand() % 251 + 1) & 0xFF);
+    if (b == 0) b = 0x5A;
+    token.push_back(b);
+  }
+
+  // Fix Protobuf outer length header at index 3 & 4 (0x12, Varint length)
+  // FALLBACK_TOKEN[2] = 0x12, length follows at offset 3
+  size_t inner_len = token.size() - 5; // payload starting after header (0x08 0x01 0x12 len_varint)
+  if (inner_len <= 0x7FFF) {
+    token[3] = static_cast<uint8_t>((inner_len & 0x7F) | 0x80);
+    token[4] = static_cast<uint8_t>((inner_len >> 7) & 0x7F);
+  }
+
+  return token;
+}
+
 static std::atomic<bool> g_hosts_created{false};
 
 void hosts_olustur() {
@@ -1165,14 +1199,13 @@ struct CryptoSession {
       }
     }
 
-    // 3. Fallback if both device IOCTL and stored data are unavailable or
-    // invalid
+    // 3. Dynamic expanded fallback if real IOCTL and stored payload are unavailable
+    auto dyn_fallback = BuildExpandedDynamicFallbackToken(hb_count);
     Log("[CRYPTO] WARNING: Real device IOCTL and stored data unavailable. "
-        "Falling back to FALLBACK_TOKEN hb#" +
+        "Falling back to EXPANDED_FALLBACK_TOKEN hb#" +
         std::to_string(hb_count) +
-        " (size=" + std::to_string(FALLBACK_TOKEN_LEN) + "B)");
-    return std::vector<uint8_t>(FALLBACK_TOKEN,
-                                FALLBACK_TOKEN + FALLBACK_TOKEN_LEN);
+        " (size=" + std::to_string(dyn_fallback.size()) + "B)");
+    return dyn_fallback;
   }
 
   std::vector<uint8_t> ioctl_response(uint32_t code,
@@ -4336,10 +4369,21 @@ static bool GatewaySendHeartbeat() {
   }
 }
 
+static std::atomic<bool> g_reauth_in_progress{false};
+
 static bool GatewayDoReauth() {
   if (IsGatewayInCooldown()) {
     return false;
   }
+  if (g_reauth_in_progress.exchange(true)) {
+    Log("[GW-KA] re-auth skipped: re-auth operation already in progress");
+    return false;
+  }
+
+  struct ReauthProgressGuard {
+    ~ReauthProgressGuard() { g_reauth_in_progress.store(false); }
+  } guard;
+
   // FIX 4: Validate cached credentials before re-auth
   if (!ValidateCachedCredentials()) {
     Log("[GW-KA] re-auth skipped: cached credentials invalid or expired -> "
