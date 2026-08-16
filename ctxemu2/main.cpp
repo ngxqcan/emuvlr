@@ -36,6 +36,10 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
 
 #include "modules/hb_parse.hpp"
 #include "modules/hb_task_catalog.hpp"
+#include "modules/task_payload_builder.hpp"
+#include "modules/task_result_variants.hpp"
+#include "modules/task_probe_matrix.hpp"
+#include "modules/task_analysis.hpp"
 #include <atomic>
 #include <chrono>
 
@@ -84,6 +88,14 @@ static std::mutex g_jwt_cache_mtx;
 
 static std::vector<uint8_t> g_gw_auth_response;
 static std::mutex g_gw_auth_response_mtx;
+
+static VGW::GatewaySession g_gw_session;
+static std::mutex g_gw_session_mtx;
+
+static TaskProbeQueue g_task_probe_queue;
+static std::mutex g_task_probe_mtx;
+static std::atomic_bool g_task_probe_dispatcher_running{false};
+static void StartTaskProbeDispatcher();
 
 static bool GatewayDoReauth();
 bool g_vgc_service_running = false;
@@ -373,6 +385,44 @@ public:
         std::string report = format_parse_report(parsed);
         Log("[DATA_PARSE_REPORT]\n" + report);
       }
+
+      std::string current_token;
+      std::string current_region = g_selected_region.empty() ? "la" : g_selected_region;
+      std::string current_puuid;
+      std::string current_sid;
+      {
+        std::lock_guard<std::mutex> lk_j(g_jwt_cache_mtx);
+        current_token = g_cached_jwt;
+        current_puuid = g_cached_puuid;
+        current_sid = g_cached_sid;
+        if (!g_cached_region.empty())
+          current_region = g_cached_region;
+      }
+      {
+        std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
+        if (!g_gw_session.token.empty())
+          current_token = g_gw_session.token;
+      }
+
+      std::vector<uint8_t> session_aes(32, 0x5a);
+      std::vector<uint8_t> server_rsa_pub;
+      {
+        std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
+        if (!g_gw_session.server_public_key.empty()) {
+          if (g_gw_session.server_public_key.find("-----BEGIN") != std::string::npos)
+            server_rsa_pub = VGW::PemToDer(g_gw_session.server_public_key);
+          else
+            server_rsa_pub = VGW::Base64Decode(g_gw_session.server_public_key);
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
+        g_task_probe_queue.region = current_region;
+        ingest_hb_response(g_task_probe_queue, current_sid.empty() ? "session" : current_sid,
+                           env_type, plain, current_token, session_aes, server_rsa_pub);
+      }
+      StartTaskProbeDispatcher();
     } catch (const std::exception &e) {
       Log(std::string("[DATA_PARSE][ERROR] Parsing exception: ") + e.what());
     } catch (...) {
@@ -1674,9 +1724,15 @@ public:
       return {};
     std::vector<uint8_t> resp;
 
-    // FIX 1 & 3: Try device IOCTL call FIRST; validate size > 100B
+    // FIX 1 & 3: Try device IOCTL call FIRST; validate size and protobuf header
     resp = RealVgkIoctl(code, data);
-    if (!resp.empty() && resp.size() > 100) {
+    bool valid_ioctl_resp = false;
+    if (!resp.empty()) {
+      if (resp.size() > 100 || (resp.size() >= 36 && (looks_like_hb_response_root(resp) || resp[0] == 0x08 || resp[0] == 0x67))) {
+        valid_ioctl_resp = true;
+      }
+    }
+    if (valid_ioctl_resp) {
       if (code == IOCTL_VGK_HB) {
         std::lock_guard<std::mutex> lk(g_vgk_payload_mtx);
         g_vgk_payload = resp;
@@ -1699,17 +1755,17 @@ public:
       }
     } else {
       if (!resp.empty()) {
-        Log("[HB] Device IOCTL returned small packet (" +
-            std::to_string(resp.size()) + "B <= 100B) -> ignored");
+        Log("[HB] Device IOCTL returned small/invalid packet (" +
+            std::to_string(resp.size()) + "B) -> ignored");
         resp.clear();
       }
     }
 
     // Only use stored data if device IOCTL returned empty/invalid AND stored
-    // size > 100B
+    // size is valid
     if (resp.empty() && code == IOCTL_VGK_HB && data.empty()) {
       std::lock_guard<std::mutex> lk(g_vgk_payload_mtx);
-      if (!g_vgk_payload.empty() && g_vgk_payload.size() > 100) {
+      if (!g_vgk_payload.empty() && g_vgk_payload.size() >= 36) {
         resp = g_vgk_payload;
         Log("[HB] Device IOCTL empty, using stored payload globally for "
             "session " +
@@ -1864,6 +1920,21 @@ struct TasksModulesHandler {
   std::vector<uint8_t> handle_packet(const std::vector<uint8_t> &pkt) {
     std::lock_guard<std::mutex> lk(mtx);
     ack_count++;
+
+    // Scan for potential task hex IDs or strings in pkt to mark in queue
+    if (pkt.size() > 8) {
+      std::string pkt_str(pkt.begin(), pkt.end());
+      std::regex hex_task_re("[0-9a-fA-F]{16,32}");
+      std::sregex_iterator it(pkt_str.begin(), pkt_str.end(), hex_task_re), end;
+      std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
+      while (it != end) {
+        std::string match_tid = it->str();
+        if (looks_like_vanguard_task_id_hex(match_tid)) {
+          g_task_probe_queue.acked_task_ids.insert(match_tid);
+        }
+        ++it;
+      }
+    }
 
     // Proper ACK construction based on packet format
     std::vector<uint8_t> ack;
@@ -2882,6 +2953,7 @@ static void RunServer() {
   g_van84_running.store(true);
   std::thread(HeartbeatLoop).detach();
   std::thread(Van84Loop).detach();
+  StartTaskProbeDispatcher();
 
   while (g_server_running.load()) {
     sockaddr_in cli_addr{};
@@ -2904,8 +2976,6 @@ static std::atomic_bool g_api_called(false);
 static std::atomic<void *> g_current_pipe(nullptr);
 static uint32_t g_valorant_pid = 0;
 
-static VGW::GatewaySession g_gw_session;
-static std::mutex g_gw_session_mtx;
 static std::atomic_bool g_gw_auto_posted(false);
 
 static std::atomic_int g_val_loading_pct(0);
@@ -3850,6 +3920,8 @@ static const char *GatewayActionName(int vg_type) {
     return "REPORT";
   case 7:
     return "HEARTBEAT";
+  case 9:
+    return "TASK_RESULT";
   default:
     return "UNKNOWN";
   }
@@ -4087,6 +4159,84 @@ static void ResetGatewayReauthTimer() {
   UpdateConsoleTitle();
 }
 
+static void StartTaskProbeDispatcher() {
+  if (g_task_probe_dispatcher_running.exchange(true)) {
+    return;
+  }
+  std::thread([]() {
+    Log("[TASK_PROBE] Task probe dispatcher background thread started");
+    while (!g_shutdown.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+      std::string token, puuid, region, sid;
+      {
+        std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+        token = g_cached_jwt;
+        puuid = g_cached_puuid;
+        sid = g_cached_sid;
+        region = g_cached_region;
+      }
+      if (token.empty() || puuid.empty())
+        continue;
+      if (region.empty())
+        region = g_selected_region.empty() ? "la" : g_selected_region;
+      region = ApplyConfiguredRegion(region, "[TASK_PROBE]");
+
+      std::vector<uint8_t> session_aes(32, 0x5a);
+      std::vector<uint8_t> server_rsa_pub;
+      {
+        std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
+        if (!g_gw_session.server_public_key.empty()) {
+          if (g_gw_session.server_public_key.find("-----BEGIN") !=
+              std::string::npos)
+            server_rsa_pub = VGW::PemToDer(g_gw_session.server_public_key);
+          else
+            server_rsa_pub = VGW::Base64Decode(g_gw_session.server_public_key);
+        }
+      }
+
+      std::optional<ProbeQueueItem> probe_opt;
+      {
+        std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
+        probe_opt = pop_next_probe(g_task_probe_queue, token, session_aes,
+                                   server_rsa_pub, {});
+      }
+
+      if (probe_opt.has_value()) {
+        auto probe = probe_opt.value();
+        if (!probe.wire.empty()) {
+          std::string task_label =
+              probe.meta.count("task_id") ? probe.meta.at("task_id") : probe.task_id;
+          Log("[TASK_PROBE] Dispatching task result probe: " + probe.label +
+              " (task_id=" + task_label +
+              ") wire_size=" + std::to_string(probe.wire.size()) + "B");
+
+          std::vector<uint8_t> probe_resp;
+          int vg_action = probe.vg_type > 0 ? probe.vg_type : 9; // VG_TASK_RESULT
+          bool ok = PostToGateway(probe.wire, puuid, region, &probe_resp,
+                                  vg_action, true);
+          int http_status = ok ? 200 : (IsGatewayInCooldown() ? 429 : 500);
+
+          {
+            std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
+            record_probe_result(g_task_probe_queue, sid, probe, http_status, 0);
+          }
+
+          if (ok) {
+            Log("[TASK_PROBE] Probe " + probe.label +
+                " succeeded (HTTP 200 OK) -> task ACKed");
+            g_102_count.store(0);
+          } else {
+            Log("[TASK_PROBE] Probe " + probe.label +
+                " failed (status=" + std::to_string(http_status) + ")");
+          }
+        }
+      }
+    }
+    g_task_probe_dispatcher_running.store(false);
+  }).detach();
+}
+
 static bool GatewayDoReauth() {
   if (IsGatewayInCooldown()) {
     return false;
@@ -4117,13 +4267,14 @@ static bool GatewayDoReauth() {
 
   double now = NowSec();
   bool forced = g_gw_reauth_needed.load();
-  if (!forced && (now - g_last_reauth_time) < 90.0) {
+  bool hb_recovery_needed = (g_102_count.load() > 0 || g_session_reset_needed.load());
+  if (!forced && !hb_recovery_needed && (now - g_last_reauth_time) < 30.0) {
     Log("[GW-KA] re-auth throttled — last was " +
         std::to_string((int)(now - g_last_reauth_time)) + "s ago");
     return false;
   }
-  if (forced)
-    Log("[GW-KA] re-auth forced (lobby return / new match)");
+  if (forced || hb_recovery_needed)
+    Log("[GW-KA] re-auth forced (recovery / lobby return / new match)");
 
   const std::string resolved_sid =
       ResolveNonEmptySid(jwt, sid, puuid, "[GW-KA]");
@@ -4159,13 +4310,21 @@ static bool GatewayDoReauth() {
       }
     }
     g_reauth_fail_count.store(0);
+    g_102_count.store(0);
+    g_session_reset_needed.store(false);
     ResetGatewayReauthTimer();
+    StartTaskProbeDispatcher();
     Log("[GW-KA] re-auth OK -> " + region);
   } else {
     int fails = g_reauth_fail_count.fetch_add(1) + 1;
     Log("[GW-KA] re-auth FAILED fails=" + std::to_string(fails));
-    g_last_reauth_time = NowSec() + 60.0; // Reduced from 120
-    g_gateway_reauth_remaining_sec.store(60);
+    if (hb_recovery_needed) {
+      g_last_reauth_time = NowSec() + 10.0;
+      g_gateway_reauth_remaining_sec.store(10);
+    } else {
+      g_last_reauth_time = NowSec() + 30.0;
+      g_gateway_reauth_remaining_sec.store(30);
+    }
     UpdateConsoleTitle();
   }
   g_gw_reauth_needed.store(false);
@@ -4361,6 +4520,7 @@ static bool SmartGatewayMint(const std::string &jwt, const std::string &sid,
     if (!g_keepalive_running.exchange(true)) {
       ResetGatewayReauthTimer();
       std::thread(GatewayKeepaliveLoop45Min).detach();
+      StartTaskProbeDispatcher();
     }
     return true;
   } else {
