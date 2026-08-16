@@ -98,6 +98,7 @@ static std::atomic_bool g_task_probe_dispatcher_running{false};
 static void StartTaskProbeDispatcher();
 
 static bool GatewayDoReauth();
+static bool GatewaySendHeartbeat();
 bool g_vgc_service_running = false;
 
 static uint32_t GetValorantPID();
@@ -177,7 +178,7 @@ constexpr int EMERGENCY_HB_MS = 6000;
 constexpr int MAX_HB_BURST = 3;
 constexpr int GATEWAY_REAUTH_INTERVAL_SEC = 30 * 60;
 
-constexpr int MIN_VALID_PAYLOAD_SIZE = 300;
+constexpr int MIN_VALID_PAYLOAD_SIZE = 32;
 constexpr int MAX_RETRY_ATTEMPTS = 3;
 constexpr int HEALTH_CHECK_INTERVAL_MS = 5000;
 constexpr int MAX_CONSECUTIVE_FAILURES = 3;
@@ -265,24 +266,62 @@ static void PushUiLogLine(const std::string &line) {
   }
 }
 
+static std::string g_last_log_msg;
+static int g_repeat_log_count = 0;
+static std::chrono::steady_clock::time_point g_last_log_tp;
+
 static void Log(const std::string &msg) {
   auto now = std::chrono::system_clock::now();
+  auto steady_now = std::chrono::steady_clock::now();
   auto t = std::chrono::system_clock::to_time_t(now);
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now.time_since_epoch()) %
             1000;
   std::tm bt{};
   localtime_s(&bt, &t);
-  std::ostringstream ss;
-  ss << "[" << std::put_time(&bt, "%H:%M:%S") << "." << std::setfill('0')
-     << std::setw(3) << ms.count() << "] " << msg;
-  std::string formatted = ss.str();
+  std::ostringstream ss_time;
+  ss_time << "[" << std::put_time(&bt, "%H:%M:%S") << "." << std::setfill('0')
+          << std::setw(3) << ms.count() << "] ";
+
   std::lock_guard<std::mutex> lk(g_log_mtx);
+
+  if (msg == g_last_log_msg) {
+    g_repeat_log_count++;
+    auto dur = std::chrono::duration_cast<std::chrono::seconds>(steady_now - g_last_log_tp).count();
+    if (g_repeat_log_count % 20 == 0 || dur >= 5) {
+      std::string rep_line = ss_time.str() + msg + " [repeated x" + std::to_string(g_repeat_log_count) + "]";
+      std::cout << rep_line << std::endl;
+      if (g_log_file.is_open()) {
+        g_log_file << rep_line << "\n";
+        g_log_file.flush();
+      }
+      PushUiLogLine(rep_line);
+      g_last_log_tp = steady_now;
+    }
+    return;
+  }
+
+  if (g_repeat_log_count > 1) {
+    std::string rep_summary = ss_time.str() + "  ^^^ [last message repeated " + std::to_string(g_repeat_log_count) + " times]";
+    std::cout << rep_summary << std::endl;
+    if (g_log_file.is_open()) {
+      g_log_file << rep_summary << "\n";
+      g_log_file.flush();
+    }
+    PushUiLogLine(rep_summary);
+  }
+
+  g_last_log_msg = msg;
+  g_repeat_log_count = 1;
+  g_last_log_tp = steady_now;
+
+  std::string formatted = ss_time.str() + msg;
   std::cout << formatted << std::endl;
   if (g_log_file.is_open()) {
     g_log_file << formatted << "\n";
     g_log_file.flush();
   }
+  PushUiLogLine(formatted);
 }
 
 class DataAnalysisManager {
@@ -4178,9 +4217,6 @@ static void StartTaskProbeDispatcher() {
       }
       if (token.empty() || puuid.empty())
         continue;
-      if (region.empty())
-        region = g_selected_region.empty() ? "la" : g_selected_region;
-      region = ApplyConfiguredRegion(region, "[TASK_PROBE]");
 
       std::vector<uint8_t> session_aes(32, 0x5a);
       std::vector<uint8_t> server_rsa_pub;
@@ -4205,6 +4241,10 @@ static void StartTaskProbeDispatcher() {
       if (probe_opt.has_value()) {
         auto probe = probe_opt.value();
         if (!probe.wire.empty()) {
+          if (region.empty())
+            region = g_selected_region.empty() ? "la" : g_selected_region;
+          region = ApplyConfiguredRegion(region, "[TASK_PROBE]");
+
           std::string task_label =
               probe.meta.count("task_id") ? probe.meta.at("task_id") : probe.task_id;
           Log("[TASK_PROBE] Dispatching task result probe: " + probe.label +
@@ -4235,6 +4275,65 @@ static void StartTaskProbeDispatcher() {
     }
     g_task_probe_dispatcher_running.store(false);
   }).detach();
+}
+
+static bool GatewaySendHeartbeat() {
+  std::string jwt, puuid, region, sid;
+  std::vector<uint8_t> prev_resp;
+  {
+    std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+    jwt = g_cached_jwt;
+    puuid = g_cached_puuid;
+    sid = g_cached_sid;
+    region = g_cached_region;
+  }
+  {
+    std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
+    if (!g_gw_session.ready || g_gw_session.last_auth_response.empty()) {
+      return false;
+    }
+    prev_resp = g_gw_session.last_auth_response;
+  }
+
+  if (puuid.empty())
+    return false;
+  if (region.empty())
+    region = g_selected_region.empty() ? "ap" : g_selected_region;
+  region = ApplyConfiguredRegion(region, "[GW-HB]");
+
+  std::string server_pub_out;
+  std::string eph_out;
+  auto hb_envelope =
+      VGW::BuildGatewayHeartbeatPayload(prev_resp, server_pub_out, &eph_out);
+  if (hb_envelope.empty()) {
+    Log("[GW-HB] Failed to build heartbeat payload");
+    return false;
+  }
+
+  std::vector<uint8_t> hb_resp;
+  bool ok = PostToGateway(hb_envelope, puuid, region, &hb_resp, 7, true);
+  if (ok && !hb_resp.empty()) {
+    Log("[GW-HB] Gateway Heartbeat OK (Action 7, resp=" +
+        std::to_string(hb_resp.size()) + "B)");
+    g_data_analysis_mgr.ProcessReceivedData(hb_resp, "Gateway:HEARTBEAT");
+    g_102_count.store(0);
+    g_session_reset_needed.store(false);
+
+    {
+      std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
+      g_gw_session.last_auth_response = hb_resp;
+      if (!eph_out.empty())
+        g_gw_session.ephemeral_identifiers = eph_out;
+      if (!server_pub_out.empty())
+        g_gw_session.server_public_key = server_pub_out;
+    }
+    if (!sid.empty())
+      g_fallback.update(sid, hb_resp);
+    return true;
+  } else {
+    Log("[GW-HB] Gateway Heartbeat FAILED");
+    return false;
+  }
 }
 
 static bool GatewayDoReauth() {
@@ -4333,8 +4432,10 @@ static bool GatewayDoReauth() {
 
 static void GatewayKeepaliveLoop45Min() {
   Log("[GW-KA] Gateway keepalive loop started.");
+  int hb_ticker = 0;
   while (g_keepalive_running.load()) {
     Sleep(1000);
+    hb_ticker++;
 
     if (g_gateway_reauth_restart_countdown.exchange(false)) {
       g_gateway_reauth_remaining_sec.store(GATEWAY_REAUTH_INTERVAL_SEC);
@@ -4343,6 +4444,12 @@ static void GatewayKeepaliveLoop45Min() {
     int rem = g_gateway_reauth_remaining_sec.fetch_sub(1) - 1;
     if (rem % 10 == 0 || rem <= 10) {
       UpdateConsoleTitle();
+    }
+
+    // Live Gateway Heartbeat (Action 7) every 25 seconds
+    if (hb_ticker >= 25) {
+      hb_ticker = 0;
+      GatewaySendHeartbeat();
     }
 
     if (rem <= 0 || g_gw_reauth_needed.load()) {
@@ -4521,6 +4628,7 @@ static bool SmartGatewayMint(const std::string &jwt, const std::string &sid,
       ResetGatewayReauthTimer();
       std::thread(GatewayKeepaliveLoop45Min).detach();
       StartTaskProbeDispatcher();
+      std::thread(GatewaySendHeartbeat).detach();
     }
     return true;
   } else {

@@ -430,7 +430,7 @@ namespace VGW {
          OutputDebugStringA(buf); } while(0)
 #endif
 
-constexpr size_t MIN_VALID_PAYLOAD_SIZE = 300;
+constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
 
     // Response / Envelope headers from IDC scan:
     static const uint8_t AUTH_RESPONSE_HEADER[]   = { 0x08, 0x03, 0x12 }; // IDC scan: AUTH request/response header
@@ -866,7 +866,7 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 300;
         if (pos >= payload.size() || payload[pos++] != 0x08) return {};
         if (pos >= payload.size()) return {};
         uint8_t type = payload[pos++];
-        if (type != 0x03 && type != 0x04 && type != 0x07) {
+        if (type != 0x03 && type != 0x04 && type != 0x07 && type != 0x09) {
             GW_LOG("[GW] DecryptGatewayResponse rejected invalid response type: 0x%02X\n", type);
             return {};
         }
