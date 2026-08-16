@@ -1,0 +1,11 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -D_MT
+    - -D_DLL
+    - -D_CONSOLE
+    - -DUNICODE
+    - -D_UNICODE
+    - -Ictxemu2
+    - -Ictxemu2/imgui
+    - -Ictxemu2/modules

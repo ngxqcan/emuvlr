@@ -1,0 +1,13 @@
+.vs/ 
+*.exe 
+*.pdb 
+*.ilk 
+*.obj 
+*.tlog 
+*.log 
+*.idb 
+*.iobj 
+*.ipdb 
+intermediate/ 
+x64/ 
+build/ 

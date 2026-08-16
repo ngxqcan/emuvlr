@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sentialist - Admin Panel</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    background: #0a0a0f;
+    color: #e0e0e0;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .bg-glow {
+    position: fixed; top: -200px; left: 50%; transform: translateX(-50%);
+    width: 600px; height: 600px;
+    background: radial-gradient(circle, rgba(99,102,241,0.15) 0%, transparent 70%);
+    pointer-events: none; z-index: 0;
+  }
+
+  .container {
+    max-width: 900px; margin: 0 auto; padding: 40px 20px;
+    position: relative; z-index: 1;
+  }
+
+  .header {
+    text-align: center; margin-bottom: 40px;
+  }
+  .header h1 {
+    font-size: 2.2rem; font-weight: 800;
+    background: linear-gradient(135deg, #818cf8, #6366f1, #4f46e5);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    letter-spacing: -0.5px;
+  }
+  .header p {
+    color: #6b7280; font-size: 0.9rem; margin-top: 6px;
+  }
+
+  .stats-row {
+    display: flex; gap: 16px; margin-bottom: 30px;
+  }
+  .stat-card {
+    flex: 1; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; padding: 20px; text-align: center;
+    backdrop-filter: blur(10px);
+    transition: border-color 0.3s;
+  }
+  .stat-card:hover { border-color: rgba(99,102,241,0.3); }
+  .stat-card .num {
+    font-size: 2rem; font-weight: 700; color: #818cf8;
+  }
+  .stat-card .label {
+    font-size: 0.8rem; color: #6b7280; text-transform: uppercase;
+    letter-spacing: 1px; margin-top: 4px;
+  }
+
+  .panel {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 16px; padding: 28px;
+    backdrop-filter: blur(10px); margin-bottom: 24px;
+  }
+  .panel-title {
+    font-size: 1.1rem; font-weight: 600; color: #c7d2fe;
+    margin-bottom: 18px; display: flex; align-items: center; gap: 8px;
+  }
+  .panel-title .icon { font-size: 1.2rem; }
+
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  .btn {
+    padding: 10px 22px; border: none; border-radius: 8px;
+    font-family: 'Inter', sans-serif; font-size: 0.85rem; font-weight: 600;
+    cursor: pointer; transition: all 0.2s; display: inline-flex;
+    align-items: center; gap: 6px;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    color: #fff; box-shadow: 0 4px 15px rgba(99,102,241,0.3);
+  }
+  .btn-primary:hover {
+    box-shadow: 0 6px 25px rgba(99,102,241,0.5);
+    transform: translateY(-1px);
+  }
+  .btn-danger {
+    background: rgba(239,68,68,0.15); color: #f87171;
+    border: 1px solid rgba(239,68,68,0.2);
+  }
+  .btn-danger:hover { background: rgba(239,68,68,0.25); }
+  .btn-secondary {
+    background: rgba(255,255,255,0.06); color: #a5b4fc;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .btn-secondary:hover { background: rgba(255,255,255,0.1); }
+  .btn-success {
+    background: rgba(34,197,94,0.15); color: #4ade80;
+    border: 1px solid rgba(34,197,94,0.2);
+  }
+  .btn-success:hover { background: rgba(34,197,94,0.25); }
+  .btn-sm { padding: 6px 14px; font-size: 0.78rem; }
+
+  .gen-count {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+  }
+  .gen-count label { color: #9ca3af; font-size: 0.85rem; }
+  .gen-count input {
+    width: 70px; padding: 8px 12px; border-radius: 8px;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+    color: #e0e0e0; font-family: 'Inter', sans-serif; font-size: 0.9rem;
+    text-align: center;
+  }
+  .gen-count input:focus { outline: none; border-color: #6366f1; }
+
+  .key-table {
+    width: 100%; border-collapse: collapse; margin-top: 12px;
+  }
+  .key-table th {
+    text-align: left; padding: 10px 14px; font-size: 0.75rem;
+    text-transform: uppercase; letter-spacing: 1px; color: #6b7280;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .key-table td {
+    padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.03);
+    font-size: 0.88rem; vertical-align: middle;
+  }
+  .key-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+  .key-text {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.92rem; color: #a5b4fc; letter-spacing: 1.5px;
+    cursor: pointer;
+  }
+  .key-text:hover { color: #c7d2fe; }
+
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 20px;
+    font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .badge-active { background: rgba(34,197,94,0.15); color: #4ade80; }
+  .badge-inactive { background: rgba(239,68,68,0.15); color: #f87171; }
+
+  .search-bar {
+    width: 100%; padding: 10px 16px; border-radius: 8px;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+    color: #e0e0e0; font-family: 'Inter', sans-serif; font-size: 0.88rem;
+    margin-bottom: 14px;
+  }
+  .search-bar:focus { outline: none; border-color: #6366f1; }
+  .search-bar::placeholder { color: #4b5563; }
+
+  .empty-state {
+    text-align: center; padding: 40px; color: #4b5563;
+  }
+  .empty-state .em-icon { font-size: 3rem; margin-bottom: 12px; opacity: 0.5; }
+  .empty-state p { font-size: 0.9rem; }
+
+  .toast {
+    position: fixed; bottom: 30px; right: 30px;
+    background: rgba(34,197,94,0.9); color: #fff;
+    padding: 12px 24px; border-radius: 10px;
+    font-size: 0.85rem; font-weight: 600;
+    transform: translateY(100px); opacity: 0;
+    transition: all 0.3s ease; z-index: 999;
+    backdrop-filter: blur(10px);
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.error { background: rgba(239,68,68,0.9); }
+
+  .textarea-export {
+    width: 100%; min-height: 120px; padding: 14px;
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; color: #a5b4fc; font-family: monospace;
+    font-size: 0.85rem; resize: vertical; margin-top: 12px;
+  }
+  .textarea-export:focus { outline: none; border-color: #6366f1; }
+
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .fade-in { animation: fadeIn 0.3s ease forwards; }
+</style>
+</head>
+<body>
+<div class="bg-glow"></div>
+<div class="container">
+  <div class="header">
+    <h1>Sentialist Admin Panel</h1>
+    <p>Key Management System</p>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="num" id="totalKeys">0</div>
+      <div class="label">Total Keys</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" id="activeKeys">0</div>
+      <div class="label">Active</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" id="inactiveKeys">0</div>
+      <div class="label">Inactive</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title"><span class="icon">⚡</span> Generate Keys</div>
+    <div class="gen-count">
+      <label>How many keys:</label>
+      <input type="number" id="genCount" value="1" min="1" max="100">
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="generateKeys()">Generate</button>
+      <button class="btn btn-secondary" onclick="exportKeys()">📋 Copy All Keys</button>
+      <button class="btn btn-success" onclick="downloadKeys()">💾 Download keys.txt</button>
+      <button class="btn btn-danger" onclick="deleteAllKeys()">🗑 Delete All</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title"><span class="icon">📦</span> Import Keys</div>
+    <textarea class="textarea-export" id="importArea" placeholder="Paste keys here (one per line, format: XXXX-XXXX-XXXX)"></textarea>
+    <div style="margin-top:12px">
+      <button class="btn btn-secondary" onclick="importKeys()">Import Keys</button>
+      <button class="btn btn-secondary" onclick="loadFromFile()">📂 Load from keys.txt</button>
+    </div>
+    <input type="file" id="fileInput" accept=".txt" style="display:none" onchange="handleFile(event)">
+  </div>
+
+  <div class="panel">
+    <div class="panel-title"><span class="icon">🔑</span> Keys</div>
+    <input type="text" class="search-bar" id="searchInput" placeholder="Search keys..." oninput="renderKeys()">
+    <div id="keyList"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let keys = JSON.parse(localStorage.getItem('sentialist_keys') || '[]');
+
+function save() {
+  localStorage.setItem('sentialist_keys', JSON.stringify(keys));
+  updateStats();
+}
+
+function updateStats() {
+  document.getElementById('totalKeys').textContent = keys.length;
+  document.getElementById('activeKeys').textContent = keys.filter(k => k.active).length;
+  document.getElementById('inactiveKeys').textContent = keys.filter(k => !k.active).length;
+}
+
+function showToast(msg, error) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (error ? ' error' : '');
+  setTimeout(() => t.className = 'toast', 2500);
+}
+
+function randChar() {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  return c[Math.floor(Math.random() * c.length)];
+}
+
+function genKey() {
+  let k = '';
+  for (let g = 0; g < 3; g++) {
+    if (g) k += '-';
+    for (let i = 0; i < 4; i++) k += randChar();
+  }
+  return k;
+}
+
+function generateKeys() {
+  const n = Math.min(parseInt(document.getElementById('genCount').value) || 1, 100);
+  let added = 0;
+  for (let i = 0; i < n; i++) {
+    let k;
+    do { k = genKey(); } while (keys.find(x => x.key === k));
+    keys.unshift({ key: k, active: true, created: new Date().toISOString().slice(0, 19).replace('T', ' ') });
+    added++;
+  }
+  save(); renderKeys();
+  showToast(added + ' key(s) generated!');
+}
+
+function toggleKey(idx) {
+  keys[idx].active = !keys[idx].active;
+  save(); renderKeys();
+}
+
+function deleteKey(idx) {
+  keys.splice(idx, 1);
+  save(); renderKeys();
+  showToast('Key deleted');
+}
+
+function deleteAllKeys() {
+  if (!confirm('Delete ALL keys?')) return;
+  keys = []; save(); renderKeys();
+  showToast('All keys deleted');
+}
+
+function copyKey(k) {
+  navigator.clipboard.writeText(k).then(() => showToast('Key copied!'));
+}
+
+function exportKeys() {
+  const txt = keys.filter(k => k.active).map(k => k.key).join('\n');
+  navigator.clipboard.writeText(txt).then(() => showToast('Active keys copied!'));
+}
+
+function downloadKeys() {
+  const txt = keys.filter(k => k.active).map(k => k.key).join('\r\n');
+  const blob = new Blob([txt], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'keys.txt';
+  a.click();
+  showToast('keys.txt downloaded! Place it next to loader.exe');
+}
+
+function importKeys() {
+  const lines = document.getElementById('importArea').value.split('\n').map(l => l.trim()).filter(l => /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(l));
+  let added = 0;
+  for (const k of lines) {
+    if (!keys.find(x => x.key === k)) {
+      keys.unshift({ key: k, active: true, created: new Date().toISOString().slice(0, 19).replace('T', ' ') });
+      added++;
+    }
+  }
+  save(); renderKeys();
+  document.getElementById('importArea').value = '';
+  showToast(added + ' key(s) imported!');
+}
+
+function loadFromFile() { document.getElementById('fileInput').click(); }
+function handleFile(e) {
+  const f = e.target.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = function(ev) {
+    document.getElementById('importArea').value = ev.target.result;
+    importKeys();
+  };
+  r.readAsText(f);
+  e.target.value = '';
+}
+
+function renderKeys() {
+  const q = document.getElementById('searchInput').value.toUpperCase();
+  const filtered = keys.map((k, i) => ({ ...k, idx: i })).filter(k => !q || k.key.includes(q));
+  const el = document.getElementById('keyList');
+
+  if (filtered.length === 0) {
+    el.innerHTML = '<div class="empty-state"><div class="em-icon">🔐</div><p>No keys found. Generate some!</p></div>';
+    return;
+  }
+
+  let html = '<table class="key-table"><thead><tr><th>#</th><th>Key</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody>';
+  for (const k of filtered) {
+    const badge = k.active ? '<span class="badge badge-active">Active</span>' : '<span class="badge badge-inactive">Inactive</span>';
+    html += `<tr class="fade-in">
+      <td style="color:#4b5563">${k.idx + 1}</td>
+      <td><span class="key-text" onclick="copyKey('${k.key}')" title="Click to copy">${k.key}</span></td>
+      <td>${badge}</td>
+      <td style="color:#6b7280;font-size:0.8rem">${k.created || '-'}</td>
+      <td>
+        <button class="btn btn-sm ${k.active ? 'btn-secondary' : 'btn-success'}" onclick="toggleKey(${k.idx})">${k.active ? 'Deactivate' : 'Activate'}</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteKey(${k.idx})">Delete</button>
+      </td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+updateStats();
+renderKeys();
+</script>
+</body>
+</html>

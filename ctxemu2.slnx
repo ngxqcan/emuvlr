@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ctxemu2/ctxemu2.vcxproj" Id="344b70fc-69c2-4423-8994-1a233c1f5e7b" />
+</Solution>
