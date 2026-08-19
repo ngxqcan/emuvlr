@@ -1,9 +1,12 @@
-﻿#include "task_payload_builder.hpp"
+#include "task_payload_builder.hpp"
 #include <cstring>
 #include <cstdio>
 #include <sstream>
+#include "module_loader.hpp"
 
 using namespace std;
+
+ModuleLoader g_module_loader;
 
 static const string PC_PREFIX = "6a499d4a816869";
 static const string MOBILE_PREFIX = "6a499d358d6682";
@@ -154,7 +157,25 @@ vector<uint8_t> build_task_payload(
     auto blob = cache.get_module(cdn_clean, region, false);
 
     if (is_module_task(ent, cdn_clean)) {
-        if (cdn_clean.empty() || pc_fetched) {
+        if (blob) {
+            // Verify SHA256
+            if (!ent.module_sha256_hex.empty() && blob->sha256_hex != ent.module_sha256_hex) {
+                fprintf(stderr, "[build_task_payload] SHA256 mismatch for %s. Expected: %s, Got: %s\n",
+                    cdn_clean.c_str(), ent.module_sha256_hex.c_str(), blob->sha256_hex.c_str());
+            } else {
+                if (g_module_loader.load(blob->mod_id, blob->cache_path)) {
+                    string tmpl = normalize_template(ent.template_json);
+                    auto out = g_module_loader.execute(blob->mod_id, 
+                                        reinterpret_cast<const uint8_t*>(tmpl.data()), 
+                                        tmpl.size());
+                    if (!out.empty()) {
+                        return out;
+                    }
+                }
+            }
+        }
+        
+        if (cdn_clean.empty() || pc_fetched || blob) {
             mod_id = _module_id_for_task(ent, cdn_clean);
             string json = build_mc_sentinel_json();
             return vector<uint8_t>(json.begin(), json.end());
@@ -163,9 +184,6 @@ vector<uint8_t> build_task_payload(
 
     string tmpl = normalize_template(ent.template_json);
     if (!tmpl.empty()) return vector<uint8_t>(tmpl.begin(), tmpl.end());
-
-    if (!cdn_clean.empty()) {
-    }
 
     if (task_id.substr(0, PC_PREFIX.size()) == PC_PREFIX) {
         string json = build_npt_survey_json();

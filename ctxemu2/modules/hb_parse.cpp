@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include "vg_http.hpp"
+#include "vg_crypto.hpp"
 
 using namespace std;
 
 static const regex CDN_SHORT_RE("/v1/cdn/mod/\\d+\\?verify=[0-9A-Za-z%\\-\\._\\+/=]+", regex_constants::icase);
-static const regex URL_RE("https?://[^\s\\x00\"'<>]+", regex_constants::icase);
+static const regex URL_RE("https?://[^\\s\\x00\"'<>]+", regex_constants::icase);
 
 uint64_t read_varint(const vector<uint8_t>& data, size_t& pos) {
     uint64_t result = 0;
@@ -47,12 +49,47 @@ string resolve_cdn_url(const string& path, const string& region) {
     if (path.empty()) return "";
     if (path.substr(0, 4) == "http") return path;
     string base = "https://cdn";
-    if (region != "la") base += "-" + region;
+    if (!region.empty() && region != "la") base += "-" + region;
+    if (path.front() == '/') return base + ".gateway.net" + path;
     return base + ".gateway.net/" + path;
 }
 
 ModuleBlob download_module(const string& cdn_path, const string& region, const string& cookies) {
     ModuleBlob blob;
+    if (cdn_path.empty()) return blob;
+
+    string url = resolve_cdn_url(cdn_path, region);
+    if (url.empty()) return blob;
+
+    // mod_id çıkar
+    string mod_id = cdn_path;
+    size_t pos = cdn_path.find("/v1/cdn/mod/");
+    if (pos != string::npos) {
+        mod_id = cdn_path.substr(pos + 13);
+        size_t q = mod_id.find('?');
+        if (q != string::npos) mod_id = mod_id.substr(0, q);
+    }
+
+    // HTTP GET with retry
+    auto resp = http_get(url, cookies, 10, 2);
+    if (resp.status_code != 200 || resp.body.empty()) return blob;
+
+    blob.mod_id = mod_id;
+    blob.cdn_path = cdn_path;
+    blob.url = url;
+    blob.data = std::move(resp.body);
+    blob.sha256_hex = vg_crypto::sha256_hex(blob.data.data(), blob.data.size());
+
+    // Cache'e yaz
+    fs::path cache_root = fs::current_path().parent_path().parent_path() / "logs" / "modules_cache";
+    fs::create_directories(cache_root);
+    blob.cache_path = cache_root / (mod_id + ".bin");
+    FILE* f = fopen(blob.cache_path.string().c_str(), "wb");
+    if (f) {
+        fwrite(blob.data.data(), 1, blob.data.size(), f);
+        fclose(f);
+    }
+
     return blob;
 }
 

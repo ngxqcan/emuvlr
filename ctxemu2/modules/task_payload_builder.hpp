@@ -84,6 +84,37 @@ public:
         std::string clean = sanitize_cdn_path(cdn_path);
         if (clean.empty()) return std::nullopt;
         if (blobs.count(clean)) return blobs[clean];
+
+        std::string mod_id = mod_id_from_path(clean);
+        if (mod_id.empty()) mod_id = clean;
+
+        fs::path p = fs::current_path().parent_path().parent_path() / "logs" / "modules_cache" / (mod_id + ".bin");
+        if (fs::exists(p) && fs::file_size(p) > 0) {
+            FILE* f = fopen(p.string().c_str(), "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz > 0) {
+                    std::vector<uint8_t> data(sz);
+                    size_t read_bytes = fread(data.data(), 1, sz, f);
+                    fclose(f);
+                    if (read_bytes == static_cast<size_t>(sz)) {
+                        ModuleBlob blob;
+                        blob.mod_id = mod_id;
+                        blob.cdn_path = clean;
+                        blob.url = resolve_cdn_url(clean, region);
+                        blob.data = std::move(data);
+                        blob.cache_path = p;
+                        blobs[clean] = blob;
+                        return blob;
+                    }
+                } else {
+                    fclose(f);
+                }
+            }
+        }
+
         if (pc_fetched.count(clean)) return std::nullopt;
         if (!allow_download) return std::nullopt;
 

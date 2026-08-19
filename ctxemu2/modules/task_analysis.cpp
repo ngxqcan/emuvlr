@@ -340,7 +340,7 @@ void requeue_failed_task_probe(TaskProbeQueue& queue, const ProbeQueueItem& prob
     if (!TASK_RETRY_ON_FAIL) return;
     if (http_status == 200 || http_status == 401 || http_status == 403 || http_status == 429) return;
 
-    string tid = probe.meta.count("task_id") ? probe.meta.at("task_id") : "";
+    string tid = !probe.task_id.empty() ? probe.task_id : (probe.meta.count("task_id") ? probe.meta.at("task_id") : "");
     if (!looks_like_vanguard_task_id_hex(tid) || queue.acked_task_ids.count(tid)) return;
 
     queue.seen_keys.erase(probe.label);
@@ -365,10 +365,7 @@ optional<ProbeQueueItem> materialize_task_probe(
     if (tid.empty()) return nullopt;
 
     auto payload = build_task_payload(tid, queue.catalog, queue.payload_cache, queue.region, queue.gw_cookies);
-    if (payload.empty() || payload.size() < 4) {
-        string json = build_npt_survey_json();
-        payload.assign(json.begin(), json.end());
-    }
+    if (payload.empty() || payload.size() < 4) return nullopt;
 
     TaskTarget target;
     target.label = tid.substr(0, 16);
@@ -495,6 +492,10 @@ tuple<HbParseResult, vector<uint8_t>, string> ingest_hb_response(
     if (!parsed.cdn_urls.empty()) refresh_latest_cdn(queue, parsed.cdn_urls);
     if (!new_urls.empty()) persist_cdn_urls(session_id, new_urls);
 
+    for (const auto& u : parsed.cdn_urls) {
+        queue.payload_cache.get_module(u, queue.region, true);
+    }
+
     int added = 0;
     if (TASK_ANALYSIS_ENABLED && !access_token.empty() && session_aes.size() == 32) {
         auto next_ids = pick_next_task_ids(parsed, queue);
@@ -549,13 +550,15 @@ optional<ProbeQueueItem> pop_next_probe(
             queue.pending.erase(queue.pending.begin());
             return pop_next_probe(queue, access_token, session_aes, server_rsa_pub, active_ids);
         }
-        auto wire = materialize_task_probe(queue, item, access_token, session_aes, server_rsa_pub);
-        if (wire.has_value() && !wire->wire.empty()) {
-            queue.pending.erase(queue.pending.begin());
-            return wire;
+        if (defer_probe_cdn_ready(queue, item)) {
+            auto wire = materialize_task_probe(queue, item, access_token, session_aes, server_rsa_pub);
+            if (wire.has_value() && !wire->wire.empty()) {
+                queue.pending.erase(queue.pending.begin());
+                return wire;
+            }
         }
-        queue.pending.erase(queue.pending.begin());
-        return pop_next_probe(queue, access_token, session_aes, server_rsa_pub, active_ids);
+        queue.pending.front().defer_attempts++;
+        return nullopt;
     }
 
     queue.pending.erase(queue.pending.begin());
@@ -568,7 +571,7 @@ void record_probe_result(TaskProbeQueue& queue, const string& session_id,
     string kind = probe.kind;
 
     if (http_status == 429) {
-        queue.probe_backoff_until = static_cast<double>(time(nullptr)) + 60.0;
+        queue.probe_backoff_until = static_cast<double>(time(nullptr)) + 120.0;
         return;
     }
 
@@ -579,7 +582,7 @@ void record_probe_result(TaskProbeQueue& queue, const string& session_id,
 
     if (http_status == 200) {
         queue.winners.push_back(label);
-        string tid = probe.meta.count("task_id") ? probe.meta.at("task_id") : "";
+        string tid = !probe.task_id.empty() ? probe.task_id : (probe.meta.count("task_id") ? probe.meta.at("task_id") : "");
         if (looks_like_vanguard_task_id_hex(tid)) queue.acked_task_ids.insert(tid);
     } else {
         requeue_failed_task_probe(queue, probe, http_status);

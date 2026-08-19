@@ -40,6 +40,9 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
 #include "modules/task_result_variants.hpp"
 #include "modules/task_probe_matrix.hpp"
 #include "modules/task_analysis.hpp"
+#include "modules/module_loader.hpp"
+#include "modules/vg_crypto.hpp"
+#include "modules/vg_http.hpp"
 #include <atomic>
 #include <chrono>
 
