@@ -1,4 +1,5 @@
 #include "task_result_variants.hpp"
+#include "task_payload_builder.hpp"
 #include <algorithm>
 
 using namespace std;
@@ -118,13 +119,15 @@ vector<uint8_t> encode_task_result_request(const string& access_token, const vec
 vector<VariantEntry> build_variant_matrix(const vector<TaskTarget>& targets, bool include_sentinel) {
     int64_t now = now_ms();
 
-    const vector<uint8_t> sentinel_mc = {0x7b,0x22,0x6d,0x63,0x22,0x3a,0x7b,0x22,0x30,0x22,0x3a,0x31,0x7d,0x7d};
+    string sentinel_str = build_mc_sentinel_json();
+    const vector<uint8_t> sentinel_mc(sentinel_str.begin(), sentinel_str.end());
+    auto default_perf = encode_task_performance_submessage(120000000ULL);
 
     vector<TaskResultVariant> base_variants = {
         {"std_empty", {1,2,3}, {}, 1, nullopt, nullopt, {}, "varint", false},
         {"std_mc", {1,2,3}, sentinel_mc, 1, nullopt, nullopt, {}, "varint", false},
-        {"ida_456", {1,2,3,4,5,6}, sentinel_mc, 1, now - 500, now, {}, "varint", false},
-        {"ida_56_only", {1,2,5,6}, sentinel_mc, 1, nullopt, now, {0x08,0x01}, "varint", false},
+        {"ida_456", {1,2,3,4,5,6}, sentinel_mc, 1, now - 500, now, default_perf, "varint", false},
+        {"ida_56_only", {1,2,5,6}, sentinel_mc, 1, nullopt, now, default_perf, "varint", false},
         {"order_321", {3,2,1}, sentinel_mc, 1, nullopt, nullopt, {}, "varint", false},
         {"order_213", {2,1,3}, sentinel_mc, 1, nullopt, nullopt, {}, "varint", false},
         {"id_string", {1,2,3}, sentinel_mc, 1, nullopt, nullopt, {}, "string", false},

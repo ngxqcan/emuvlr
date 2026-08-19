@@ -1,5 +1,7 @@
 #include "task_probe_matrix.hpp"
 #include "task_result_variants.hpp"
+#include "task_payload_builder.hpp"
+#include "../vanguard_gateway.h"
 #include <cstring>
 
 using namespace std;
@@ -21,10 +23,14 @@ string payload_head_preview(const vector<uint8_t>& data, size_t n) {
 vector<uint8_t> rg_encrypt_session(const vector<uint8_t>& plain,
     const vector<uint8_t>& session_aes,
     const vector<uint8_t>& server_rsa_pub) {
-    return plain;
+    std::vector<uint8_t> pubkey = !server_rsa_pub.empty() ? server_rsa_pub : VGW::GetRiotPubkeyDer();
+    return VGW::BuildPayload(plain, pubkey, static_cast<uint8_t>(VG_TASK_RESULT));
 }
 
 vector<uint8_t> wrap_envelope(int type, const vector<uint8_t>& payload) {
+    // If payload is already a full Riot encrypted envelope, return it
+    if (payload.size() >= 4 && payload[0] == 0x08) return payload;
+
     vector<uint8_t> out;
     uint64_t key = (static_cast<uint64_t>(type) << 3) | 2;
     while (key >= 0x80) {
@@ -54,14 +60,17 @@ vector<uint8_t> build_task_wire_for_target(
     TaskResultVariant variant;
     variant.name = variant_name;
     variant.data = payload;
-    variant.field_order = {1, 2, 3};
+    variant.field_order = {1, 2, 3, 4, 5, 6};
     variant.status = 1;
+    int64_t now = now_ms();
+    variant.start_time = now - 120;
+    variant.end_time = now;
+    variant.performance_sub = encode_task_performance_submessage(120000000ULL);
     variant.id_wire = "string";
 
     auto sub = encode_task_result_submessage(variant, target);
     auto plain = encode_task_result_request(access_token, {sub});
-    auto rg = rg_encrypt_session(plain, session_aes, server_rsa_pub);
-    return wrap_envelope(VG_TASK_RESULT, rg);
+    return rg_encrypt_session(plain, session_aes, server_rsa_pub);
 }
 
 AtomicProbe build_single_task_probe(

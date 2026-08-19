@@ -1,4 +1,4 @@
-﻿#include "task_analysis.hpp"
+#include "task_analysis.hpp"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -365,7 +365,10 @@ optional<ProbeQueueItem> materialize_task_probe(
     if (tid.empty()) return nullopt;
 
     auto payload = build_task_payload(tid, queue.catalog, queue.payload_cache, queue.region, queue.gw_cookies);
-    if (payload.empty() || payload.size() < 4) return nullopt;
+    if (payload.empty() || payload.size() < 4) {
+        string json = build_npt_survey_json();
+        payload.assign(json.begin(), json.end());
+    }
 
     TaskTarget target;
     target.label = tid.substr(0, 16);
@@ -374,12 +377,14 @@ optional<ProbeQueueItem> materialize_task_probe(
     auto atom = build_single_task_probe(access_token, session_aes, server_rsa_pub, target, payload);
 
     ProbeQueueItem result;
+    result.key = atom.key;
     result.kind = atom.kind;
     result.wire = atom.wire;
     result.label = atom.key;
     result.vg_type = atom.vg_type;
     result.relay_flags = atom.relay_flags;
     result.meta = atom.meta;
+    result.task_id = tid;
     return result;
 }
 
@@ -544,15 +549,13 @@ optional<ProbeQueueItem> pop_next_probe(
             queue.pending.erase(queue.pending.begin());
             return pop_next_probe(queue, access_token, session_aes, server_rsa_pub, active_ids);
         }
-        if (defer_probe_cdn_ready(queue, item)) {
-            auto wire = materialize_task_probe(queue, item, access_token, session_aes, server_rsa_pub);
-            if (wire.has_value()) {
-                queue.pending.erase(queue.pending.begin());
-                return wire;
-            }
+        auto wire = materialize_task_probe(queue, item, access_token, session_aes, server_rsa_pub);
+        if (wire.has_value() && !wire->wire.empty()) {
+            queue.pending.erase(queue.pending.begin());
+            return wire;
         }
-        queue.pending.front().defer_attempts++;
-        return queue.pending.front();
+        queue.pending.erase(queue.pending.begin());
+        return pop_next_probe(queue, access_token, session_aes, server_rsa_pub, active_ids);
     }
 
     queue.pending.erase(queue.pending.begin());

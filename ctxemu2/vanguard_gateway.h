@@ -799,9 +799,28 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         std::vector<uint8_t> plain(pLen);
         NTSTATUS st = BCryptDecrypt(hKey, (PUCHAR)cipher.data(), (ULONG)cipher.size(),
             &pad, nullptr, 0, plain.data(), pLen, &pLen, BCRYPT_PAD_OAEP);
-        plain.resize(pLen);
-        if (st != 0) return {};
-        return plain;
+        if (st == 0 && pLen > 0) {
+            plain.resize(pLen);
+            return plain;
+        }
+
+        // If session key failed and we have embedded key, fallback to embedded key
+        if (g_hSessionPrivKey) {
+            BCRYPT_KEY_HANDLE hEmbed = LoadEmbeddedPrivateKey();
+            if (hEmbed) {
+                pLen = 0;
+                (void)BCryptDecrypt(hEmbed, (PUCHAR)cipher.data(), (ULONG)cipher.size(),
+                    &pad, nullptr, 0, nullptr, 0, &pLen, BCRYPT_PAD_OAEP);
+                plain.resize(pLen);
+                st = BCryptDecrypt(hEmbed, (PUCHAR)cipher.data(), (ULONG)cipher.size(),
+                    &pad, nullptr, 0, plain.data(), pLen, &pLen, BCRYPT_PAD_OAEP);
+                if (st == 0 && pLen > 0) {
+                    plain.resize(pLen);
+                    return plain;
+                }
+            }
+        }
+        return {};
     }
 
     static std::vector<uint8_t> RsaEncryptWithRetry(BCRYPT_KEY_HANDLE hKey,
@@ -1009,6 +1028,14 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
 
         auto hbProto = EncodeHeartbeatRequest(resp.token, eph_id);
         return BuildPayload(hbProto, server_pub_der, 0x07);
+    }
+
+    static std::vector<uint8_t> BuildGatewayTaskResultPayload(
+        const std::vector<uint8_t>& task_result_proto,
+        const std::vector<uint8_t>& server_pub_der)
+    {
+        std::vector<uint8_t> pubkey = !server_pub_der.empty() ? server_pub_der : GetRiotPubkeyDer();
+        return BuildPayload(task_result_proto, pubkey, 0x09);
     }
 
     struct GatewaySession {

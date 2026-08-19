@@ -18,15 +18,15 @@
 static constexpr bool TASK_WIRE_ENABLED = true;
 static constexpr bool TASK_ANALYSIS_ENABLED = true;
 static constexpr bool TASK_RETRY_ON_FAIL = true;
-static constexpr double TASK_RETRY_BACKOFF_SEC = 3.0;
-static constexpr double TASK_PROBE_INTERVAL_SEC = 2.0;
-static constexpr double TASK_PROBE_INTERVAL_BUSY_SEC = 0.75;
-static constexpr int MAX_PROBE_QUEUE = 48;
-static constexpr int PROBE_QUEUE_PRESSURE = 28;
-static constexpr int PROBE_401_BACKOFF_SEC = 300;
-static constexpr int MAX_TASKS_PER_HB_INGEST = 1;
-static constexpr int HB_MIN_BEFORE_TASK_PROBES = 2;
-static constexpr int MAX_DEFER_CDN_ATTEMPTS = 5;
+static constexpr double TASK_RETRY_BACKOFF_SEC = 2.0;
+static constexpr double TASK_PROBE_INTERVAL_SEC = 1.0;
+static constexpr double TASK_PROBE_INTERVAL_BUSY_SEC = 0.5;
+static constexpr int MAX_PROBE_QUEUE = 64;
+static constexpr int PROBE_QUEUE_PRESSURE = 32;
+static constexpr int PROBE_401_BACKOFF_SEC = 15;
+static constexpr int MAX_TASKS_PER_HB_INGEST = 4;
+static constexpr int HB_MIN_BEFORE_TASK_PROBES = 1;
+static constexpr int MAX_DEFER_CDN_ATTEMPTS = 3;
 static constexpr int MAX_FLUSH_PER_CDN = 4;
 static constexpr int HB_DUMP_MAX_PER_SESSION = 80;
 
