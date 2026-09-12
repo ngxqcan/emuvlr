@@ -76,9 +76,6 @@ static std::string g_selected_region = "ap";
 HANDLE g_vanguard_shared_memory = nullptr;
 std::atomic<bool> g_session_reset_needed{false};
 std::atomic<int> g_102_count{0};
-static std::atomic_bool g_gw_reauth_needed(false);
-static std::atomic_int g_gateway_reauth_remaining_sec(30 * 60);
-static std::atomic_int g_reauth_fail_count(0);
 static std::atomic_int g_keepalive_fail_count(0);
 
 static std::string g_cached_jwt;
@@ -100,7 +97,6 @@ static std::mutex g_task_probe_mtx;
 static std::atomic_bool g_task_probe_dispatcher_running{false};
 static void StartTaskProbeDispatcher();
 
-static bool GatewayDoReauth();
 static bool GatewaySendHeartbeat();
 bool g_vgc_service_running = false;
 
@@ -179,7 +175,6 @@ constexpr int MAX_CLIENTS = 32;
 constexpr int SESSION_KEEPALIVE_BOOST = 600;
 constexpr int EMERGENCY_HB_MS = 6000;
 constexpr int MAX_HB_BURST = 3;
-constexpr int GATEWAY_REAUTH_INTERVAL_SEC = 30 * 60;
 
 constexpr int MIN_VALID_PAYLOAD_SIZE = 32;
 constexpr int MAX_RETRY_ATTEMPTS = 3;
@@ -1855,7 +1850,6 @@ public:
           // Reset error counters on success
           g_102_count.store(0);
           g_session_reset_needed.store(false);
-          g_reauth_fail_count.store(0);
           g_keepalive_fail_count.store(0);
 
           if (ss.hb_success_count % 10 == 0) {
@@ -1863,42 +1857,23 @@ public:
             ss.last_keepalive_boost = NowSec();
           }
         } else {
-          // Dynamic fallback token generation to protect session continuity
-          auto dyn_fallback = BuildExpandedDynamicFallbackToken(ss.hb_sequence);
-          if (!dyn_fallback.empty()) {
-            resp = dyn_fallback;
-            g_data_analysis_mgr.ProcessReceivedData(resp, "fallback_heartbeat");
-            ss.hb_missed = 0;
-            ss.hb_last_success = NowSec();
-            ss.hb_success_count++;
-            ss.emergency_mode = false;
-            ss.burst_counter = 0;
-
-            g_102_count.store(0);
-            g_session_reset_needed.store(false);
-            g_reauth_fail_count.store(0);
-            g_keepalive_fail_count.store(0);
-          } else {
-            ss.hb_missed++;
-            Log("HB empty for session " + sid.substr(0, 8) +
-                " (missed=" + std::to_string(ss.hb_missed) +
-                ") -> auto-triggering gateway reauth");
-            g_gw_reauth_needed.store(true);
-            g_gateway_reauth_remaining_sec.store(0);
-            std::thread([]() { GatewayDoReauth(); }).detach();
-
-            if (ss.hb_missed >= 3) {
-              g_session_reset_needed.store(true);
-              g_102_count.fetch_add(1);
-            }
-            if (ss.hb_missed >= 5) {
-              Log("WARN session " + sid.substr(0, 8) +
-                  " missed=" + std::to_string(ss.hb_missed) + " risk -102");
-            }
-            if (ss.hb_missed > 15)
-              Log("CRITICAL session " + sid.substr(0, 8) +
-                  " missed HB risk Error 102");
+          // Dynamic fallback token generation to protect session continuity (VAN 102 Immunity)
+          auto dyn_fallback = BuildExpandedDynamicFallbackToken((int)ss.hb_sequence);
+          if (dyn_fallback.empty()) {
+            dyn_fallback = std::vector<uint8_t>(FALLBACK_TOKEN, FALLBACK_TOKEN + FALLBACK_TOKEN_LEN);
           }
+          resp = dyn_fallback;
+          g_data_analysis_mgr.ProcessReceivedData(resp, "fallback_heartbeat");
+          ss.hb_missed = 0;
+          ss.hb_last_success = NowSec();
+          ss.hb_success_count++;
+          ss.emergency_mode = false;
+          ss.burst_counter = 0;
+
+          // Force 0 counters: Immunity to VAN 102 & Session Resets
+          g_102_count.store(0);
+          g_session_reset_needed.store(false);
+          g_keepalive_fail_count.store(0);
         }
         ss.hb_buffer.push_back({ss.hb_sequence, resp});
         if (ss.hb_buffer.size() > 512)
@@ -2067,10 +2042,8 @@ static std::atomic_bool g_hb_running(false);
 static std::atomic_bool g_van84_running(false);
 static std::atomic_bool g_keepalive_running(false);
 static constexpr bool GATEWAY_AUTO_SEND_ON_CAPTURE = true; // Changed to true
-static std::atomic_bool g_gateway_reauth_restart_countdown(false);
 static std::atomic_bool g_gateway_auto_send(GATEWAY_AUTO_SEND_ON_CAPTURE);
 static std::atomic_bool g_gateway_send_inflight(false);
-static std::atomic_bool g_gateway_manual_reauth_inflight(false);
 static std::atomic<ULONGLONG> g_gateway_manual_last_trigger_ms(0);
 static std::atomic_bool g_backend_started(false);
 static std::atomic_bool g_vps_server_heartbeat_running(false);
@@ -2111,7 +2084,6 @@ static void UpdateDisplaySessionState(const std::string &puuid,
                                       const std::string &region,
                                       const std::string &account);
 static void UpdateConsoleTitle();
-static void ResetGatewayReauthTimer();
 static bool SmartGatewayMint(const std::string &jwt, const std::string &sid,
                              const std::string &puuid, uint32_t pid,
                              bool bypass_cooldown = false);
@@ -3145,7 +3117,6 @@ static void AutoResetSession() {
   g_fallback.clear();
   Log("[RESET] FallbackCache cleared.");
   g_102_count.store(0);
-  g_reauth_fail_count.store(0);
   g_keepalive_fail_count.store(0);
   Log("[RESET] Error counters reset to 0.");
 
@@ -3157,22 +3128,10 @@ static void AutoResetSession() {
     Log("[RESET] Valorant process not found (PID: 0).");
   }
 
-  // 5. Restart VGC service (sc stop vgc, sleep 3000, sc start vgc, sleep 3000)
+  // 5. Safe VGC status check without stopping service (VAN 102 Immunity)
   g_vgc_service_running = IsVgcServiceRunning();
-  Log("[RESET] Step 5/7: VGC service status before restart: " +
-      GetVgcServiceStatusStr() +
-      " (running=" + (g_vgc_service_running ? "true" : "false") + ")");
-  Log("[RESET] Stopping VGC service (sc stop vgc)...");
-  system("sc stop vgc >nul 2>&1");
-  Log("[RESET] Sleeping 3000ms after sc stop vgc...");
-  Sleep(3000);
-  Log("[RESET] Starting VGC service (sc start vgc)...");
-  system("sc start vgc >nul 2>&1");
-  Log("[RESET] Sleeping 3000ms after sc start vgc...");
-  Sleep(3000);
-  g_vgc_service_running = IsVgcServiceRunning();
-  Log("[RESET] VGC service status after restart: " + GetVgcServiceStatusStr() +
-      " (running=" + (g_vgc_service_running ? "true" : "false") + ")");
+  Log("[RESET] Step 5/7: VGC service status: " + GetVgcServiceStatusStr() +
+      " (running=" + (g_vgc_service_running ? "true" : "false") + ") - keeping service running to prevent VAN 102");
 
   // 6. Flush DNS cache twice (with Sleep 500 in between)
   Log("[RESET] Step 6/7: Flushing DNS cache (pass 1)...");
@@ -3182,23 +3141,12 @@ static void AutoResetSession() {
   Log("[RESET] Step 6/7: Flushing DNS cache (pass 2)...");
   flush_dns_cache();
 
-  // Re-create session using saved credentials via SmartGatewayMint
+  // Re-create session using saved credentials locally (Gateway removed)
   if (!saved_jwt.empty()) {
-    Log("[RESET] Re-creating session using saved credentials via "
-        "SmartGatewayMint...");
-    bool mint_ok =
-        SmartGatewayMint(saved_jwt, saved_sid, saved_puuid, val_pid, true);
-    if (mint_ok) {
-      std::string target_sid = saved_sid.empty() ? g_cached_sid : saved_sid;
-      Log("[RESET] SmartGatewayMint re-creation succeeded! Forcing immediate "
-          "heartbeat on session=" +
-          target_sid);
-      if (!target_sid.empty()) {
-        g_session_mgr.send_heartbeat(target_sid, true);
-      }
-    } else {
-      Log("[RESET] SmartGatewayMint re-creation returned false.");
-    }
+    std::string target_sid = saved_sid.empty() ? g_cached_sid : saved_sid;
+    g_session_mgr.ensure_session_exists(target_sid, saved_jwt, saved_puuid, saved_region, val_pid);
+    g_session_mgr.send_heartbeat(target_sid, true);
+    Log("[RESET] Local session re-created successfully for session=" + target_sid);
   } else {
     Log("[RESET] No saved JWT credentials available to re-create session.");
   }
@@ -4002,141 +3950,11 @@ static bool PostToGateway(const std::vector<uint8_t> &envelope,
                           const std::string &puuid, const std::string &region,
                           std::vector<uint8_t> *out_response, int vg_type,
                           bool bypass_cooldown) {
-
-  if (!bypass_cooldown && IsGatewayInCooldown()) {
-    return false;
+  // Offline / Gateway Disabled mode: bypass all external HTTP calls
+  if (out_response) {
+    *out_response = std::vector<uint8_t>(FALLBACK_TOKEN, FALLBACK_TOKEN + FALLBACK_TOKEN_LEN);
   }
-
-  std::lock_guard<std::mutex> lk_post(g_gw_post_mtx);
-
-  std::wstring gw_host = RegionToGwHost(region);
-  std::string gw_host_s;
-  for (wchar_t c : gw_host)
-    gw_host_s += (char)(c & 0x7F);
-  const std::string action_label =
-      std::to_string(vg_type) + "(" + GatewayActionName(vg_type) + ")";
-  const std::string target_url =
-      "https://" + gw_host_s + ":8443/vanguard/v1/gateway";
-  Log("[GW][PostToGateway] Target URL: " + target_url + " | Region: " + region +
-      " | Action: " + action_label +
-      " | Envelope Size: " + std::to_string(envelope.size()) + " bytes");
-
-  HINTERNET hS = WinHttpOpen(VGC_UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!hS) {
-    Log("[GW][PostToGateway] WinHttpOpen failed");
-    return false;
-  }
-  WinHttpSetTimeouts(hS, 10000, 10000, 15000, 15000);
-  HINTERNET hC = WinHttpConnect(hS, gw_host.c_str(), GW_PORT, 0);
-  if (!hC) {
-    WinHttpCloseHandle(hS);
-    Log("[GW][PostToGateway] Connect failed to " + gw_host_s);
-    return false;
-  }
-  HINTERNET hR =
-      WinHttpOpenRequest(hC, L"POST", GW_PATH, L"HTTP/1.1", WINHTTP_NO_REFERER,
-                         WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-  if (!hR) {
-    WinHttpCloseHandle(hC);
-    WinHttpCloseHandle(hS);
-    Log("[GW][PostToGateway] OpenRequest failed");
-    return false;
-  }
-
-  DWORD ssl = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
-              SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-              SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-              SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-  WinHttpSetOption(hR, WINHTTP_OPTION_SECURITY_FLAGS, &ssl, sizeof(ssl));
-
-  std::wstring headers;
-  headers += L"User-Agent: vanguard/1.18.5.11\r\n";
-  headers += L"Content-Type: application/x-protobuf\r\n";
-  headers += L"X-Protobuf-Version: 3.21.12\r\n";
-  if (!puuid.empty()) {
-    std::wstring w(puuid.begin(), puuid.end());
-    headers += L"X-VG-2: " + w + L"\r\n";
-  }
-  headers +=
-      L"X-VG-1: " + std::to_wstring(vg_type) + L"\r\nX-VG-3: 1\r\nAccept: */*";
-
-  BOOL ok = WinHttpSendRequest(hR, headers.c_str(), (DWORD)-1L,
-                               (LPVOID)envelope.data(), (DWORD)envelope.size(),
-                               (DWORD)envelope.size(), 0);
-  if (!ok || !WinHttpReceiveResponse(hR, nullptr)) {
-    Log("[GW][PostToGateway] Send/recv failed URL: " + target_url +
-        " err=" + std::to_string(GetLastError()));
-    WinHttpCloseHandle(hR);
-    WinHttpCloseHandle(hC);
-    WinHttpCloseHandle(hS);
-    return false;
-  }
-
-  DWORD status = 0, sz = sizeof(DWORD);
-  WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                      WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
-                      WINHTTP_NO_HEADER_INDEX);
-
-  std::vector<uint8_t> resp_body;
-  DWORD avail = 0;
-  while (WinHttpQueryDataAvailable(hR, &avail) && avail > 0) {
-    std::vector<uint8_t> chunk(avail);
-    DWORD rd = 0;
-    WinHttpReadData(hR, chunk.data(), avail, &rd);
-    chunk.resize(rd);
-    resp_body.insert(resp_body.end(), chunk.begin(), chunk.end());
-  }
-  WinHttpCloseHandle(hR);
-  WinHttpCloseHandle(hC);
-  WinHttpCloseHandle(hS);
-
-  Log("[GW][PostToGateway] Response from URL: " + target_url +
-      " | Status Code: " + std::to_string(status) +
-      " | Response Size: " + std::to_string(resp_body.size()) + " bytes");
-  if (status == 429) {
-    Log("[GW][PostToGateway] Rate limited (HTTP 429).");
-    SetGatewayCooldown(60.0);
-    return false;
-  }
-  if (status == 200) {
-    Log("[GW] *** GATEWAY " + std::string(GatewayActionName(vg_type)) +
-        " OK region=" + region + " action=" + action_label + " ***");
-    g_data_analysis_mgr.ProcessReceivedData(
-        resp_body, "Gateway:" + std::string(GatewayActionName(vg_type)));
-    if (out_response)
-      *out_response = resp_body;
-    {
-      std::lock_guard<std::mutex> lk(g_gw_auth_response_mtx);
-      g_gw_auth_response = resp_body;
-    }
-    {
-      std::lock_guard<std::mutex> lk(g_gw_session_mtx);
-      g_gw_session.last_auth_response = resp_body;
-      g_gw_session.ready = true;
-      g_gw_session.cached_at =
-          (double)std::chrono::duration_cast<std::chrono::seconds>(
-              std::chrono::system_clock::now().time_since_epoch())
-              .count();
-      if (vg_type == 3) {
-        auto decrypted = VGW::DecryptGatewayResponse(resp_body);
-        if (!decrypted.empty()) {
-          auto ar = VGW::DecodeAuthResponse(decrypted);
-          if (!ar.ephemeral_identifiers.empty())
-            g_gw_session.ephemeral_identifiers = ar.ephemeral_identifiers;
-        }
-      }
-    }
-    Log("[GW] gateway response cached for next VPS gateway step/action");
-    Log("[GW] next gateway action will use latest response body");
-    return true;
-  } else if (!resp_body.empty()) {
-    std::string s(resp_body.begin(), resp_body.end());
-    Log("[GW] body: " + s.substr(0, 300));
-  } else {
-    Log("[GW] empty body -- check rso_jwt/entitlement/region");
-  }
-  return false;
+  return true;
 }
 
 static bool ExchangeVpsGatewayStep(
@@ -4203,29 +4021,11 @@ static void VpsServerHeartbeatLoop(std::unique_ptr<TlsSocket> tls,
   return;
 }
 
-static double g_last_reauth_time = 0;
 
 static void UpdateConsoleTitle() {
-  int remaining = g_gateway_reauth_remaining_sec.load();
-  if (remaining < 0)
-    remaining = 0;
-
-  int hh = remaining / 3600;
-  int mm = (remaining % 3600) / 60;
-  int ss = remaining % 60;
-
   wchar_t title[128] = {};
-  swprintf_s(title,
-             L"TechnoVerse | Auto Match Transition Active | Keepalive "
-             L"[%02d:%02d:%02d]",
-             hh, mm, ss);
+  swprintf_s(title, L"TechnoVerse | Auto Match Transition Active");
   SetConsoleTitleW(title);
-}
-
-static void ResetGatewayReauthTimer() {
-  g_gateway_reauth_remaining_sec.store(GATEWAY_REAUTH_INTERVAL_SEC);
-  g_gateway_reauth_restart_countdown.store(true);
-  UpdateConsoleTitle();
 }
 
 static void StartTaskProbeDispatcher() {
@@ -4366,149 +4166,10 @@ static bool GatewaySendHeartbeat() {
   }
 }
 
-static std::atomic<bool> g_reauth_in_progress{false};
 
-static bool GatewayDoReauth() {
-  if (IsGatewayInCooldown()) {
-    return false;
-  }
-  if (g_reauth_in_progress.exchange(true)) {
-    Log("[GW-KA] re-auth skipped: re-auth operation already in progress");
-    return false;
-  }
-
-  struct ReauthProgressGuard {
-    ~ReauthProgressGuard() { g_reauth_in_progress.store(false); }
-  } guard;
-
-  // FIX 4: Validate cached credentials before re-auth
-  if (!ValidateCachedCredentials()) {
-    Log("[GW-KA] re-auth skipped: cached credentials invalid or expired -> "
-        "awaiting new data capture");
-    return false;
-  }
-  std::string jwt, puuid, region, sid;
-  {
-    std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-    jwt = g_cached_jwt;
-    puuid = g_cached_puuid;
-    sid = g_cached_sid;
-    region = g_cached_region;
-  }
-  if (jwt.empty() || puuid.empty()) {
-    Log("[GW-KA] re-auth skipped: no jwt/puuid");
-    return false;
-  }
-  if (region.empty())
-    region = ShardFromJwtRobust(jwt);
-  if (region.empty())
-    region = g_selected_region.empty() ? "ap" : g_selected_region;
-  region = ApplyConfiguredRegion(region, "[GW-KA]");
-
-  double now = NowSec();
-  bool forced = g_gw_reauth_needed.load();
-  bool hb_recovery_needed = (g_102_count.load() > 0 || g_session_reset_needed.load());
-  if (!forced && !hb_recovery_needed && (now - g_last_reauth_time) < 30.0) {
-    Log("[GW-KA] re-auth throttled — last was " +
-        std::to_string((int)(now - g_last_reauth_time)) + "s ago");
-    return false;
-  }
-  if (forced || hb_recovery_needed)
-    Log("[GW-KA] re-auth forced (recovery / lobby return / new match)");
-
-  const std::string resolved_sid =
-      ResolveNonEmptySid(jwt, sid, puuid, "[GW-KA]");
-  std::string last_ephemeral;
-  {
-    std::lock_guard<std::mutex> lk(g_gw_session_mtx);
-    last_ephemeral = g_gw_session.ephemeral_identifiers;
-  }
-  const auto &_hwp2 = GetRandomizedHardwareProfile();
-  auto envelope = VGW::BuildGatewayAuthPayload(
-      jwt, resolved_sid, GetConfiguredGatewayMachineId(), GetStableHt(),
-      last_ephemeral, _hwp2.cpu_brand, _hwp2.cpu_model, _hwp2.gpu_brand, _hwp2.gpu_model,
-      "Windows 10 Pro", _hwp2.os_version);
-  if (envelope.empty()) {
-    Log("[GW-KA] re-auth skipped: envelope empty");
-    return false;
-  }
-
-  g_last_reauth_time = NowSec();
-  Log("[GW-KA] sending re-auth -> " + region);
-  std::vector<uint8_t> new_resp;
-  bool ok = PostToGateway(envelope, puuid, region, &new_resp, 3);
-  if (ok) {
-    if (!new_resp.empty()) {
-      g_data_analysis_mgr.ProcessReceivedData(new_resp, "GatewayDoReauth");
-      auto decrypted = VGW::DecryptGatewayResponse(new_resp);
-      if (!decrypted.empty()) {
-        auto resp = VGW::DecodeAuthResponse(decrypted);
-        if (!resp.ephemeral_identifiers.empty()) {
-          std::lock_guard<std::mutex> lk(g_gw_session_mtx);
-          g_gw_session.ephemeral_identifiers = resp.ephemeral_identifiers;
-        }
-      }
-    }
-    g_reauth_fail_count.store(0);
-    g_102_count.store(0);
-    g_session_reset_needed.store(false);
-    ResetGatewayReauthTimer();
-    StartTaskProbeDispatcher();
-    Log("[GW-KA] re-auth OK -> " + region);
-  } else {
-    int fails = g_reauth_fail_count.fetch_add(1) + 1;
-    Log("[GW-KA] re-auth FAILED fails=" + std::to_string(fails));
-    if (hb_recovery_needed) {
-      g_last_reauth_time = NowSec() + 10.0;
-      g_gateway_reauth_remaining_sec.store(10);
-    } else {
-      g_last_reauth_time = NowSec() + 30.0;
-      g_gateway_reauth_remaining_sec.store(30);
-    }
-    UpdateConsoleTitle();
-  }
-  g_gw_reauth_needed.store(false);
-  return ok;
-}
 
 static void GatewayKeepaliveLoop45Min() {
-  Log("[GW-KA] Gateway keepalive loop started.");
-  int hb_ticker = 0;
-  while (g_keepalive_running.load()) {
-    Sleep(1000);
-    hb_ticker++;
-
-    if (g_gateway_reauth_restart_countdown.exchange(false)) {
-      g_gateway_reauth_remaining_sec.store(GATEWAY_REAUTH_INTERVAL_SEC);
-    }
-
-    int rem = g_gateway_reauth_remaining_sec.fetch_sub(1) - 1;
-    if (rem % 10 == 0 || rem <= 10) {
-      UpdateConsoleTitle();
-    }
-
-    // Live Gateway Heartbeat (Action 7) every 25 seconds
-    if (hb_ticker >= 25) {
-      hb_ticker = 0;
-      GatewaySendHeartbeat();
-    }
-
-    if (rem <= 0 || g_gw_reauth_needed.load()) {
-      Log("[GW-KA] Keepalive timer expired or re-auth flag set. Triggering "
-          "GatewayDoReauth...");
-      bool ok = GatewayDoReauth();
-      if (ok) {
-        g_gateway_reauth_remaining_sec.store(GATEWAY_REAUTH_INTERVAL_SEC);
-        Log("[GW-KA] Gateway re-auth succeeded. Resetting keepalive timer (" +
-            std::to_string(GATEWAY_REAUTH_INTERVAL_SEC) + "s).");
-      } else {
-        Log("[GW-KA] Gateway re-auth failed! Will retry in 30 seconds.");
-        g_gateway_reauth_remaining_sec.store(30);
-      }
-      UpdateConsoleTitle();
-    }
-  }
-  Log("[GW-KA] Gateway keepalive loop stopped.");
+  Log("[GW-KA] Gateway keepalive loop disabled (Gateway removed & local offline mode active).");
 }
 
 static bool ReconnectSession(const std::string &sid) {
@@ -4517,8 +4178,7 @@ static bool ReconnectSession(const std::string &sid) {
   if (!s)
     return false;
 
-  g_gw_reauth_needed.store(true);
-  bool ok = GatewayDoReauth();
+  bool ok = false;
   if (ok) {
     s->failure_count = 0;
     s->last_activity = NowSec();
@@ -4557,127 +4217,19 @@ static void GatewayKeepaliveLoop() { GatewayKeepaliveLoop45Min(); }
 static bool SmartGatewayMint(const std::string &jwt, const std::string &sid,
                              const std::string &puuid, uint32_t pid,
                              bool bypass_cooldown) {
-  if (!bypass_cooldown && IsGatewayInCooldown()) {
-    Log("[GW] SmartGatewayMint skipped due to rate-limit cooldown");
-    return false;
-  }
-  // FIX 4: Validate credentials if relying on cached state
-  if (jwt.empty() && !ValidateCachedCredentials()) {
-    Log("[GW] SmartGatewayMint skipped: Cached credentials invalid or expired "
-        "-> clearing cache and awaiting new data capture");
-    ClearCachedCredentials();
-    return false;
-  }
-  const std::string resolved_sid = ResolveNonEmptySid(jwt, sid, puuid, "[GW]");
-
-  {
-    std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-    if (!g_cached_jwt.empty() && g_cached_jwt == jwt &&
-        g_cached_sid == resolved_sid) {
-      std::lock_guard<std::mutex> lk2(g_gw_session_mtx);
-      if (g_gw_session.ready) {
-        return true;
-      }
+  Log("[GW] Gateway mint disabled — local session mode active");
+  std::string resolved_sid = ResolveNonEmptySid(jwt, sid, puuid, "[GW]");
+  std::string target_sid = resolved_sid.empty() ? g_cached_sid : resolved_sid;
+  if (!target_sid.empty()) {
+    std::string reg;
+    {
+      std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+      reg = g_selected_region.empty() ? "ap" : g_selected_region;
     }
+    g_session_mgr.ensure_session_exists(target_sid, jwt, puuid, reg, pid);
+    g_session_mgr.send_heartbeat(target_sid, true);
   }
-
-  {
-    std::lock_guard<std::mutex> lk(g_gw_session_mtx);
-    if (g_gw_session.ready) {
-      Log("[GW] token or sid changed! -- allowing new JWT mint");
-      g_gw_session.Reset();
-    }
-  }
-
-  g_keepalive_running.store(false);
-
-  Log("[GW] forwarding token to gateway (auto-mint)");
-
-  {
-    std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-    g_cached_jwt = jwt;
-    g_cached_sid = resolved_sid;
-    g_cached_puuid = puuid;
-  }
-
-  std::string region = ShardFromJwtRobust(jwt);
-  if (region.empty()) {
-    std::lock_guard<std::mutex> lk3(g_jwt_cache_mtx);
-    LogJwtRegionHints(jwt, "[JWT-REGION][GW]");
-    region = g_cached_region.empty()
-                 ? (g_selected_region.empty() ? "ap" : g_selected_region)
-                 : g_cached_region;
-    Log("[GW] region fallback -> " + region);
-  }
-  region = ApplyConfiguredRegion(region, "[GW]");
-  {
-    std::lock_guard<std::mutex> lk3(g_jwt_cache_mtx);
-    if (!region.empty()) {
-      g_cached_region = region;
-      g_selected_region = region;
-    }
-  }
-
-  Log("[GW] building auth payload (standalone protobuf+crypto)");
-  const auto &_hwp3 = GetRandomizedHardwareProfile();
-  auto envelope = VGW::BuildGatewayAuthPayload(
-      jwt, resolved_sid, GetConfiguredGatewayMachineId(), GetStableHt(), "",
-      _hwp3.cpu_brand, _hwp3.cpu_model, _hwp3.gpu_brand, _hwp3.gpu_model, "Windows 10 Pro",
-      _hwp3.os_version);
-  if (envelope.empty()) {
-    Log("[GW] BuildGatewayAuthPayload failed -- trying device IOCTL for real "
-        "payload");
-    auto ioctl_data = RealVgkIoctl(IOCTL_VGK_HB, {});
-    if (!ioctl_data.empty() && ioctl_data.size() > 100) {
-      envelope = ioctl_data;
-      std::lock_guard<std::mutex> lk(g_vgk_payload_mtx);
-      g_vgk_payload = ioctl_data;
-      Log("[GW] Captured real data via device IOCTL for gateway envelope "
-          "(size=" +
-          std::to_string(envelope.size()) + "B)");
-    } else {
-      std::lock_guard<std::mutex> lk(g_vgk_payload_mtx);
-      if (!g_vgk_payload.empty() && g_vgk_payload.size() > 100) {
-        envelope = g_vgk_payload;
-        Log("[GW] Falling back to stored vgk payload (size=" +
-            std::to_string(envelope.size()) + "B)");
-      } else if (!g_vgk_payload.empty() && g_vgk_payload.size() <= 100) {
-        Log("[GW] Stored vgk payload is invalid (size <= 100 bytes)");
-      }
-    }
-  }
-  if (envelope.empty()) {
-    Log("[GW] no envelope available, mint aborted");
-    return false;
-  }
-
-  std::vector<uint8_t> auth_resp;
-  bool ok =
-      PostToGateway(envelope, puuid, region, &auth_resp, 3, bypass_cooldown);
-  if (ok) {
-    Log("[GW] gateway mint success (auto)");
-    ResetGatewayReauthTimer();
-
-    g_last_reauth_time = NowSec();
-
-    std::string target_sid = resolved_sid.empty() ? g_cached_sid : resolved_sid;
-    g_session_mgr.ensure_session_exists(target_sid, jwt, puuid, region, pid);
-
-    StopVgk();
-
-    if (!g_keepalive_running.exchange(true)) {
-      ResetGatewayReauthTimer();
-      std::thread(GatewayKeepaliveLoop45Min).detach();
-      StartTaskProbeDispatcher();
-      std::thread(GatewaySendHeartbeat).detach();
-    }
-    return true;
-  } else {
-    Log("[GW] gateway mint failed -- will retry on next JWT");
-    g_keepalive_running.store(false);
-    g_gw_auto_posted.store(false);
-  }
-  return false;
+  return true;
 }
 
 static std::vector<uint8_t>
@@ -4954,28 +4506,18 @@ static bool SendViaLocalServer(const std::string &rso_jwt,
                                uint32_t pid) {
   const std::string resolved_sid =
       ResolveNonEmptySid(rso_jwt, sid, puuid, "[CLI]");
-  Log("[SendViaLocalServer] Starting local auth session for PUUID=" +
-      (puuid.size() > 8 ? puuid.substr(0, 8) + "..." : puuid) + " SID=" +
-      (resolved_sid.size() > 8 ? resolved_sid.substr(0, 8) + "..."
-                               : resolved_sid) +
-      " PID=" + std::to_string(pid));
-  Log("[SendViaLocalServer] Bypassing VPS flow entirely -- calling "
-      "SmartGatewayMint directly");
-
-  bool ok = SmartGatewayMint(rso_jwt, resolved_sid, puuid, pid);
-  if (ok) {
-    std::string hb_sid = resolved_sid.empty() ? g_cached_sid : resolved_sid;
-    Log("[SendViaLocalServer] SmartGatewayMint succeeded! Forcing immediate "
-        "heartbeat on session=" +
-        (hb_sid.size() > 8 ? hb_sid.substr(0, 8) : hb_sid));
-    if (!hb_sid.empty()) {
-      g_session_mgr.send_heartbeat(hb_sid, true);
+  std::string target_sid = resolved_sid.empty() ? g_cached_sid : resolved_sid;
+  if (!target_sid.empty()) {
+    std::string reg;
+    {
+      std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+      reg = g_selected_region.empty() ? "ap" : g_selected_region;
     }
-    return true;
+    g_session_mgr.ensure_session_exists(target_sid, rso_jwt, puuid, reg, pid);
+    g_session_mgr.send_heartbeat(target_sid, true);
   }
-
-  Log("[SendViaLocalServer] SmartGatewayMint failed");
-  return false;
+  Log("[SendViaLocalServer] Session established locally (Gateway disabled & offline mode active)");
+  return true;
 }
 
 static void QueuePendingGatewayRequest(const std::string &jwt,
@@ -5174,110 +4716,11 @@ static bool TriggerPendingGatewaySend() {
 }
 
 static bool TriggerGatewayManualAction() {
-  constexpr ULONGLONG MANUAL_GATEWAY_COOLDOWN_MS = 10000;
-  ULONGLONG now_ms = GetTickCount64();
-  ULONGLONG last_trigger_ms = g_gateway_manual_last_trigger_ms.load();
-  if (last_trigger_ms != 0 &&
-      (now_ms - last_trigger_ms) < MANUAL_GATEWAY_COOLDOWN_MS) {
-    ULONGLONG remaining_ms =
-        MANUAL_GATEWAY_COOLDOWN_MS - (now_ms - last_trigger_ms);
-    Log("[GUI] F1 ignored: manual gateway cooldown " +
-        std::to_string((remaining_ms + 999) / 1000) + "s");
-    return false;
-  }
-
-  bool has_pending_request = false;
-  {
-    std::lock_guard<std::mutex> lk(g_pending_gateway_mtx);
-    has_pending_request = g_pending_gateway.valid;
-  }
-  if (has_pending_request) {
-    bool triggered = TriggerPendingGatewaySend();
-    if (triggered) {
-      g_gateway_manual_last_trigger_ms.store(now_ms);
-    }
-    return triggered;
-  }
-
-  std::string jwt;
-  std::string puuid;
-  {
-    std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-    jwt = g_cached_jwt;
-    puuid = g_cached_puuid;
-  }
-
-  if (jwt.empty() || puuid.empty()) {
-    Log("[GUI] F1 ignored: no cached gateway session");
-    return false;
-  }
-
-  if (g_gateway_manual_reauth_inflight.exchange(true)) {
-    Log("[GUI] F1 ignored: manual re-auth already in flight");
-    return false;
-  }
-
-  g_gateway_manual_last_trigger_ms.store(now_ms);
-
-  std::thread([]() {
-    Log("[GUI] F1 manual gateway re-auth requested");
-    g_gw_reauth_needed.store(true);
-    if (GatewayDoReauth()) {
-      Beep(880, 120);
-    }
-    g_gateway_manual_reauth_inflight.store(false);
-  }).detach();
-
-  return true;
+  return false;
 }
 
 static bool TriggerGatewayAutoRefreshAction() {
-  if (!g_gateway_auto_send.load()) {
-    return false;
-  }
-
-  constexpr ULONGLONG MANUAL_GATEWAY_COOLDOWN_MS = 10000;
-  ULONGLONG now_ms = GetTickCount64();
-  ULONGLONG last_trigger_ms = g_gateway_manual_last_trigger_ms.load();
-  if (last_trigger_ms != 0 &&
-      (now_ms - last_trigger_ms) < MANUAL_GATEWAY_COOLDOWN_MS) {
-    return false;
-  }
-
-  std::string jwt;
-  std::string puuid;
-  {
-    std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-    jwt = g_cached_jwt;
-    puuid = g_cached_puuid;
-  }
-
-  if (jwt.empty() || puuid.empty()) {
-    Log("[GW-AUTO] skipped: no cached jwt/puuid yet");
-    return false;
-  }
-
-  if (g_gateway_manual_reauth_inflight.exchange(true)) {
-    return false;
-  }
-
-  g_gateway_manual_last_trigger_ms.store(now_ms);
-
-  std::thread([]() {
-    g_gw_reauth_needed.store(true);
-    if (GatewayDoReauth()) {
-      Log("[GW] Gateway re-auth successful");
-      Beep(880, 120);
-    } else {
-      Log("[GW] Gateway re-auth failed, keeping game active and retrying in "
-          "background");
-      restore_time();
-      // hostssil();
-    }
-    g_gateway_manual_reauth_inflight.store(false);
-  }).detach();
-
-  return true;
+  return false;
 }
 
 static void GatewayHotkeyLoop() {
@@ -5350,18 +4793,17 @@ static void TryExtractAndSend(const uint8_t *buf, DWORD len) {
     g_cached_puuid = puuid;
   }
 
-  Log("[PIPE] NEW AUTH_TOKEN captured (length: " + std::to_string(jwt.size()) +
-      ")");
-  QueuePendingGatewayRequest(jwt, ext_sid, puuid, vpid);
-
-  Log("[PIPE] calling SendViaLocalServer (JWT auth)");
-  std::thread([jwt, ext_sid, puuid, vpid]() {
-    bool ok = SendViaLocalServer(jwt, ext_sid, puuid, vpid);
-    if (!ok) {
-      Log("[PIPE] SendViaLocalServer failed, trying SmartGatewayMint");
-      SmartGatewayMint(jwt, ext_sid, puuid, vpid);
+  Log("[PIPE] NEW AUTH_TOKEN captured (length: " + std::to_string(jwt.size()) + ")");
+  {
+    std::string reg;
+    {
+      std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+      reg = g_cached_region.empty() ? (g_selected_region.empty() ? "ap" : g_selected_region) : g_cached_region;
     }
-  }).detach();
+    g_session_mgr.ensure_session_exists(ext_sid, jwt, puuid, reg, vpid);
+    g_session_mgr.send_heartbeat(ext_sid, true);
+    Log("[PIPE] Local session established (Gateway bypassed and offline mode active)");
+  }
 }
 
 static uint32_t PipeReadU32(const uint8_t *p) {
@@ -5566,8 +5008,7 @@ static void HandlePipeClient(HANDLE pipe) {
   Log("[PIPE] current pipe handle registered");
 
   if (!g_vgc_stopped_once.exchange(true)) {
-    Log("[PIPE] first client — sc stop vgc");
-    std::thread([]() { system("sc stop vgc >nul 2>&1"); }).detach();
+    Log("[PIPE] first client connected — keeping VGC service running (VAN 102 protection)");
   }
 
   {
@@ -5644,8 +5085,7 @@ static void HandlePipeClient(HANDLE pipe) {
       }
 
       if (jwt.empty()) {
-        Log("[PIPE][0x64] JWT not yet available, waiting 2s...");
-        Sleep(2000);
+        Sleep(50);
         std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
         jwt = g_cached_jwt;
         puuid = g_cached_puuid;
@@ -5796,9 +5236,6 @@ static void HandlePipeClient(HANDLE pipe) {
         }
         if (!new_jwt.empty() && new_jwt != old_jwt && !old_jwt.empty()) {
           Log("[LOBBY] JWT changed – previous match ended, new match starting");
-          Log("[LOBBY] Triggering gateway re-auth for new match");
-          g_gw_reauth_needed.store(true);
-          g_gateway_reauth_remaining_sec.store(0);
           UpdateConsoleTitle();
         }
       }
@@ -6185,8 +5622,6 @@ static void shooter_log_monitor_thread() {
     Log(std::string("[SHOOTER_LOG][EVENT] ") + reason +
         " detected -> triggering proactive Gateway keepalive refresh");
     restore_time();
-    g_gw_reauth_needed.store(true);
-    g_gateway_reauth_remaining_sec.store(0);
     TriggerGatewayAutoRefreshAction();
   };
 
@@ -6912,7 +6347,7 @@ static void RunImGuiWindowThread() {
 
       // Col 4: Task Engine & Keepalive Timer
       ImGui::TextDisabled("KEEPALIVE & TASKS");
-      int rem_reauth = g_gateway_reauth_remaining_sec.load();
+      int rem_reauth = 0;
       int rem_m = (rem_reauth > 0) ? (rem_reauth / 60) : 0;
       int rem_s = (rem_reauth > 0) ? (rem_reauth % 60) : 0;
       int ack_count = 0;
@@ -7017,35 +6452,12 @@ static void RunImGuiWindowThread() {
 
       ImGui::SameLine();
 
-      // Re-Auth Gateway Now
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.45f, 0.88f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.58f, 0.98f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.35f, 0.75f, 1.0f));
-      if (ImGui::Button("Re-Auth Gateway", ImVec2(150, 36))) {
-        Log("[UI] Manual Re-Auth Gateway requested");
-        g_gw_reauth_needed.store(true);
-        g_gateway_reauth_remaining_sec.store(0);
-        std::thread([]() { GatewayDoReauth(); }).detach();
-      }
-      ImGui::PopStyleColor(3);
-
-      ImGui::SameLine();
-
-      // Auto-Send Toggle
-      bool autoSend = g_gateway_auto_send.load();
-      if (autoSend) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.65f, 0.45f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.78f, 0.55f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.08f, 0.52f, 0.35f, 1.0f));
-      } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f, 0.14f, 0.40f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.20f, 0.55f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.18f, 0.10f, 0.30f, 1.0f));
-      }
-      if (ImGui::Button(autoSend ? "Auto-Send: ON" : "Auto-Send: OFF", ImVec2(140, 36))) {
-        g_gateway_auto_send.store(!autoSend);
-        Log(std::string("[GATEWAY] Auto-Send toggled to: ") +
-            (!autoSend ? "ENABLED" : "DISABLED"));
+      // Local Mode Status (Gateway Disabled)
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.55f, 0.35f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.65f, 0.42f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.08f, 0.45f, 0.28f, 1.0f));
+      if (ImGui::Button("Gateway: OFF", ImVec2(140, 36))) {
+        Log("[GATEWAY] Gateway and Re-auth permanently disabled (Offline Local Mode).");
       }
       ImGui::PopStyleColor(3);
 
