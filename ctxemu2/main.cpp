@@ -866,9 +866,25 @@ static std::string ResolveNonEmptySid(const std::string &jwt,
   if (!sid.empty() && sid != jwt_puuid)
     return sid;
 
-  Log(std::string(tag) +
-      " no distinct session UUID in pipe — f13 will be empty");
-  return "";
+  {
+    std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+    if (!g_cached_sid.empty() && g_cached_sid != puuid && g_cached_sid != jwt_puuid)
+      return g_cached_sid;
+  }
+
+  BYTE rnd[16];
+  BCryptGenRandom(nullptr, (PUCHAR)rnd, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  rnd[6] = (rnd[6] & 0x0F) | 0x40;
+  rnd[8] = (rnd[8] & 0x3F) | 0x80;
+  std::ostringstream ss;
+  for (int i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10)
+      ss << '-';
+    ss << std::hex << std::setfill('0') << std::setw(2) << (int)rnd[i];
+  }
+  std::string fallback_sid = ss.str();
+  Log(std::string(tag) + " using fallback distinct session UUID: " + fallback_sid);
+  return fallback_sid;
 }
 
 static bool ValidateResponse(const std::vector<uint8_t> &response) {
@@ -2011,28 +2027,65 @@ struct TasksModulesHandler {
                                            const std::string &sid,
                                            const std::string &region) {
     std::lock_guard<std::mutex> lk(mtx);
-    Log("[AUTH_REQ] 0x64 new session request — puuid=" +
-        (puuid.size() > 8 ? puuid.substr(0, 8) + "..." : puuid));
-    std::vector<uint8_t> resp;
-    if (!jwt.empty() && !puuid.empty()) {
-      resp.push_back(0x00);
-      uint32_t plen = (uint32_t)puuid.size();
-      resp.push_back((plen >> 24) & 0xFF);
-      resp.push_back((plen >> 16) & 0xFF);
-      resp.push_back((plen >> 8) & 0xFF);
-      resp.push_back(plen & 0xFF);
-      resp.insert(resp.end(), puuid.begin(), puuid.end());
-      if (!sid.empty()) {
-        uint32_t slen = (uint32_t)sid.size();
-        resp.push_back((slen >> 24) & 0xFF);
-        resp.push_back((slen >> 16) & 0xFF);
-        resp.push_back((slen >> 8) & 0xFF);
-        resp.push_back(slen & 0xFF);
-        resp.insert(resp.end(), sid.begin(), sid.end());
+    Log("[AUTH_REQ] 0x64 session request — puuid=" +
+        (puuid.size() > 8 ? puuid.substr(0, 8) + "..." : puuid) +
+        " sid=" + (sid.size() > 8 ? sid.substr(0, 8) + "..." : sid));
+
+    std::string eff_puuid = puuid;
+    if (eff_puuid.empty()) {
+      if (!jwt.empty()) {
+        eff_puuid = PuuidFromJwt(jwt);
       }
-    } else {
-      resp.push_back(0x01);
+      if (eff_puuid.empty()) {
+        std::lock_guard<std::mutex> clk(g_jwt_cache_mtx);
+        eff_puuid = g_cached_puuid;
+      }
+      if (eff_puuid.empty()) {
+        eff_puuid = "812174a5-eaef-5e5a-8c00-1cbfa10a000c";
+      }
     }
+
+    std::string eff_sid = sid;
+    if (eff_sid.empty() || eff_sid == eff_puuid) {
+      std::lock_guard<std::mutex> clk(g_jwt_cache_mtx);
+      eff_sid = g_cached_sid;
+    }
+    if (eff_sid.empty() || eff_sid == eff_puuid) {
+      BYTE rnd[16];
+      BCryptGenRandom(nullptr, (PUCHAR)rnd, 16,
+                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+      rnd[6] = (rnd[6] & 0x0F) | 0x40;
+      rnd[8] = (rnd[8] & 0x3F) | 0x80;
+      std::ostringstream ss;
+      for (int i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10)
+          ss << '-';
+        ss << std::hex << std::setfill('0') << std::setw(2) << (int)rnd[i];
+      }
+      eff_sid = ss.str();
+      std::lock_guard<std::mutex> clk(g_jwt_cache_mtx);
+      g_cached_sid = eff_sid;
+    }
+
+    // IMMUNITY TO VAN 102: ALWAYS RETURN 0x00 (SUCCESS)
+    std::vector<uint8_t> resp;
+    resp.push_back(0x00);
+    uint32_t plen = (uint32_t)eff_puuid.size();
+    resp.push_back((plen >> 24) & 0xFF);
+    resp.push_back((plen >> 16) & 0xFF);
+    resp.push_back((plen >> 8) & 0xFF);
+    resp.push_back(plen & 0xFF);
+    resp.insert(resp.end(), eff_puuid.begin(), eff_puuid.end());
+
+    uint32_t slen = (uint32_t)eff_sid.size();
+    resp.push_back((slen >> 24) & 0xFF);
+    resp.push_back((slen >> 16) & 0xFF);
+    resp.push_back((slen >> 8) & 0xFF);
+    resp.push_back(slen & 0xFF);
+    resp.insert(resp.end(), eff_sid.begin(), eff_sid.end());
+
+    Log("[AUTH_REQ] 0x64 response SUCCESS sent (puuid=" + eff_puuid.substr(0, 8) +
+        "... sid=" + eff_sid.substr(0, 8) + "...)");
     return resp;
   }
 };
@@ -4774,23 +4827,36 @@ static void TryExtractAndSend(const uint8_t *buf, DWORD len) {
     last_uuid = it->str();
   }
 
-  std::string puuid = first_uuid;
+  std::string puuid = PuuidFromJwt(jwt);
   if (puuid.empty())
-    puuid = PuuidFromJwt(jwt);
-  std::string ext_sid = ResolveNonEmptySid(jwt, last_uuid, puuid, "[PIPE]");
+    puuid = first_uuid;
+
+  std::string ext_sid;
+  if (!last_uuid.empty() && last_uuid != puuid) {
+    ext_sid = last_uuid;
+  } else if (!first_uuid.empty() && first_uuid != puuid) {
+    ext_sid = first_uuid;
+  } else {
+    ext_sid = ResolveNonEmptySid(jwt, last_uuid, puuid, "[PIPE]");
+  }
+
   uint32_t vpid = g_valorant_pid;
   Log("[PIPE] puuid=" + puuid.substr(0, 8) + " sid=" + ext_sid.substr(0, 8) +
       " pid=" + std::to_string(vpid));
 
   {
     std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-    if (jwt == g_cached_jwt && ext_sid == g_cached_ext_sid) {
+    if (jwt == g_cached_jwt && !ext_sid.empty() && ext_sid == g_cached_ext_sid) {
       return;
     }
     g_cached_jwt = jwt;
-    g_cached_ext_sid = ext_sid;
-    g_cached_sid = ext_sid;
-    g_cached_puuid = puuid;
+    if (!ext_sid.empty() && ext_sid != puuid) {
+      g_cached_ext_sid = ext_sid;
+      g_cached_sid = ext_sid;
+    }
+    if (!puuid.empty()) {
+      g_cached_puuid = puuid;
+    }
   }
 
   Log("[PIPE] NEW AUTH_TOKEN captured (length: " + std::to_string(jwt.size()) + ")");
@@ -4800,9 +4866,19 @@ static void TryExtractAndSend(const uint8_t *buf, DWORD len) {
       std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
       reg = g_cached_region.empty() ? (g_selected_region.empty() ? "ap" : g_selected_region) : g_cached_region;
     }
-    g_session_mgr.ensure_session_exists(ext_sid, jwt, puuid, reg, vpid);
-    g_session_mgr.send_heartbeat(ext_sid, true);
-    Log("[PIPE] Local session established (Gateway bypassed and offline mode active)");
+    std::string active_sid = ext_sid;
+    if (active_sid.empty() || active_sid == puuid) {
+      std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+      active_sid = g_cached_sid;
+    }
+    std::string final_sid = g_session_mgr.ensure_session_exists(active_sid, jwt, puuid, reg, vpid);
+    {
+      std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+      g_cached_sid = final_sid;
+      g_cached_ext_sid = final_sid;
+    }
+    g_session_mgr.send_heartbeat(final_sid, true);
+    Log("[PIPE] Local session established (Gateway bypassed and offline mode active) sid=" + final_sid);
   }
 }
 
@@ -5085,18 +5161,33 @@ static void HandlePipeClient(HANDLE pipe) {
       }
 
       if (jwt.empty()) {
-        Sleep(50);
+        for (int retry = 0; retry < 20 && jwt.empty(); retry++) {
+          Sleep(50);
+          std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
+          jwt = g_cached_jwt;
+          puuid = g_cached_puuid;
+          sid = g_cached_sid;
+          region = g_cached_region;
+        }
+      }
+
+      if (puuid.empty() && !jwt.empty()) {
+        puuid = PuuidFromJwt(jwt);
+      }
+      if (puuid.empty()) {
         std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-        jwt = g_cached_jwt;
         puuid = g_cached_puuid;
+      }
+      if (sid.empty()) {
+        std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
         sid = g_cached_sid;
-        region = g_cached_region;
       }
 
       region = ApplyConfiguredRegion(region, "[PIPE][0x64]");
       Log("[PIPE][0x64] jwt=" +
           (jwt.empty() ? "EMPTY" : jwt.substr(0, 20) + "...") +
-          " puuid=" + (puuid.empty() ? "EMPTY" : puuid.substr(0, 8) + "..."));
+          " puuid=" + (puuid.empty() ? "EMPTY" : puuid.substr(0, 8) + "...") +
+          " sid=" + (sid.empty() ? "EMPTY" : sid.substr(0, 8) + "..."));
 
       auto pkt = std::vector<uint8_t>(buf.data(), buf.data() + bytesRead);
       auto resp = g_tasks_handler.handle_auth_request(jwt, puuid, sid, region);
@@ -5319,7 +5410,13 @@ static void HandlePipeClient(HANDLE pipe) {
       PipeWriteAndFlush(pipe, echo, "[PIPE] default echo");
     }
   }
-  SendPipeDisconnectMessage(pipe, "pipe thread ending");
+  uint32_t val_pid_ending = GetValorantPID();
+  if (val_pid_ending == 0) {
+    SendPipeDisconnectMessage(pipe, "pipe thread ending");
+  } else {
+    Log("[PIPE][DISCONNECT] Valorant still running (PID: " + std::to_string(val_pid_ending) +
+        ") — suppressing pipe disconnect packet to prevent VAN 102");
+  }
   void *expected_pipe = (void *)pipe;
   g_current_pipe.compare_exchange_strong(expected_pipe, nullptr);
   CloseHandle(pipe);
@@ -6741,10 +6838,10 @@ int MainCMDUI(int argc, char *argv[]) {
   std::thread([]() { RunServer(); }).detach();
   Sleep(300);
 
-  system("sc stop vgc >nul 2>&1");
-  Sleep(300);
-  system("sc start vgc >nul 2>&1");
-  Sleep(500);
+  if (!IsVgcServiceRunning()) {
+    system("sc start vgc >nul 2>&1");
+    Sleep(500);
+  }
 
   HANDLE h = CreateFileW(PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                          OPEN_EXISTING, 0, nullptr);
@@ -6794,7 +6891,6 @@ int MainCMDUI(int argc, char *argv[]) {
     }
   }
 
-  system("sc stop vgc >nul 2>&1");
   return 0;
 }
 
