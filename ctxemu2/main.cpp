@@ -5083,6 +5083,17 @@ static void HandlePipeClient(HANDLE pipe) {
   g_current_pipe.store((void *)pipe);
   Log("[PIPE] current pipe handle registered");
 
+  uint32_t current_pid = GetValorantPID();
+  static uint32_t s_last_client_pid = 0;
+  if (current_pid != 0 && current_pid != s_last_client_pid) {
+    Log("[PIPE] New Valorant process detected (PID: " + std::to_string(current_pid) +
+        ", previous: " + std::to_string(s_last_client_pid) +
+        ") -> clearing stale session cache for fresh match");
+    s_last_client_pid = current_pid;
+    ClearCachedCredentials();
+    g_session_mgr.clear();
+  }
+
   if (!g_vgc_stopped_once.exchange(true)) {
     Log("[PIPE] first client connected — keeping VGC service running (VAN 102 protection)");
   }
@@ -5422,15 +5433,11 @@ static void HandlePipeClient(HANDLE pipe) {
   CloseHandle(pipe);
 
   uint32_t val_pid = GetValorantPID();
-  if (val_pid == 0) {
-    Log("[PIPE][DISCONNECT] Valorant process not running — clearing session cache");
-    g_session_reset_needed.store(false);
-    ClearCachedCredentials();
-    g_session_mgr.clear();
-  } else {
-    Log("[PIPE][DISCONNECT] Pipe connection closed, but Valorant process (PID: " +
-        std::to_string(val_pid) + ") is still active — PRESERVING session credentials for next match/lobby.");
-  }
+  Log("[PIPE][DISCONNECT] Pipe connection closed (Valorant PID: " + std::to_string(val_pid) +
+      ") — clearing session cache to prevent stale session replay on next match");
+  g_session_reset_needed.store(false);
+  ClearCachedCredentials();
+  g_session_mgr.clear();
 
   g_round_tracker.on_lobby_return([&]() {});
 }
