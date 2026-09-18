@@ -278,23 +278,34 @@ constexpr size_t MAX_PAYLOAD = 128 * 1024 * 1024;
 
 static std::mutex g_log_mtx;
 static std::ofstream g_log_file;
-static std::mutex g_ui_log_mtx;
-static std::deque<std::string> g_ui_log_lines;
 
-static std::vector<std::string> g_log_lines;
-static std::mutex g_log_mutex;
+struct UiLogEntry {
+  std::string text;
+  ImVec4 color;
+};
+
+static std::mutex g_ui_log_mtx;
+static std::deque<UiLogEntry> g_ui_log_entries;
+
+static ImVec4 DetermineLogColor(const std::string &line) {
+  if (line.find("OK") != std::string::npos || line.find("succeeded") != std::string::npos || line.find("HEALTHY") != std::string::npos) {
+    return ImVec4(0.35f, 0.92f, 0.60f, 1.0f);
+  } else if (line.find("WARN") != std::string::npos || line.find("risk") != std::string::npos || line.find("throttled") != std::string::npos) {
+    return ImVec4(0.95f, 0.78f, 0.30f, 1.0f);
+  } else if (line.find("FAIL") != std::string::npos || line.find("CRITICAL") != std::string::npos || line.find("Error") != std::string::npos) {
+    return ImVec4(0.95f, 0.35f, 0.40f, 1.0f);
+  } else if (line.find("[GW") != std::string::npos || line.find("[TASK_PROBE]") != std::string::npos) {
+    return ImVec4(0.72f, 0.60f, 1.00f, 1.0f);
+  }
+  return ImVec4(0.82f, 0.80f, 0.88f, 0.9f);
+}
 
 static void PushUiLogLine(const std::string &line) {
+  ImVec4 col = DetermineLogColor(line);
   std::lock_guard<std::mutex> lk(g_ui_log_mtx);
-  g_ui_log_lines.push_back(line);
-  while (g_ui_log_lines.size() > 300) {
-    g_ui_log_lines.pop_front();
-  }
-  {
-    std::lock_guard<std::mutex> lk2(g_log_mutex);
-    g_log_lines.push_back(line);
-    while (g_log_lines.size() > 20)
-      g_log_lines.erase(g_log_lines.begin());
+  g_ui_log_entries.push_back({line, col});
+  while (g_ui_log_entries.size() > 300) {
+    g_ui_log_entries.pop_front();
   }
 }
 
@@ -3135,6 +3146,16 @@ static void SetGatewayCooldown(double seconds = 60.0) {
 static void AutoResetSession() {
   g_session_reset_needed.store(false);
 
+  bool expected = false;
+  if (!g_session_reset_in_progress.compare_exchange_strong(expected, true)) {
+    Log("[RESET] Session reset already in progress, skipping duplicate request.");
+    return;
+  }
+
+  struct SessionResetGuard {
+    ~SessionResetGuard() { g_session_reset_in_progress.store(false); }
+  } reset_guard;
+
   // FIX 3: Check if game process is running before allowing reset
   uint32_t val_pid = GetValorantPID();
   if (val_pid == 0) {
@@ -3164,23 +3185,11 @@ static void AutoResetSession() {
   auto start_tp = std::chrono::steady_clock::now();
   Log("[RESET] AutoResetSession starting for PID " + std::to_string(val_pid) +
       "...");
-  g_session_reset_in_progress.store(true);
   g_gw_cooldown_until_sec.store(0.0);
 
   // 1. Clear session manager
   Log("[RESET] Step 1/7: Clearing session manager...");
   g_session_mgr.clear();
-
-  // 2. Reset gateway session & auth response
-  Log("[RESET] Step 2/7: Resetting gateway session and auth responses...");
-  {
-    std::lock_guard<std::mutex> lk(g_gw_session_mtx);
-    g_gw_session.Reset();
-  }
-  {
-    std::lock_guard<std::mutex> lk(g_gw_auth_response_mtx);
-    g_gw_auth_response.clear();
-  }
   g_gw_auto_posted.store(false);
 
   // 3. Preserve cached credentials (jwt, puuid, sid, region)
@@ -3250,7 +3259,6 @@ static void AutoResetSession() {
           .count();
   Log("[RESET] AutoResetSession finished in " + std::to_string(elapsed_ms) +
       " ms.");
-  g_session_reset_in_progress.store(false);
 
   // Launch background thread to force heartbeat on all sessions post-reset with
   // retries FIX 1: Do NOT use stale saved_sid from before reset. Use new SIDs
@@ -5549,21 +5557,6 @@ static void ClearConsole() {
   SetConsoleCursorPosition(h, origin);
 }
 
-static void ResizeConsoleWindowTall() {
-  HWND hwnd = GetConsoleWindow();
-  if (!hwnd)
-    return;
-
-  RECT rc{};
-  if (!GetWindowRect(hwnd, &rc))
-    return;
-
-  const int width = rc.right - rc.left;
-  const int height = 720;
-  SetWindowPos(hwnd, nullptr, rc.left, rc.top, width, height,
-               SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
 static void SetColor(WORD attr) {
   SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), attr);
 }
@@ -5577,86 +5570,6 @@ static void SetColor(WORD attr) {
 #define COL_GRAY (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
 #define COL_ORANGE (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY)
 #define COL_DIM (FOREGROUND_BLUE | FOREGROUND_INTENSITY)
-
-static std::string ShortValue(const std::string &value, size_t keep = 8) {
-  if (value.empty())
-    return "--";
-  if (value.size() <= keep)
-    return value;
-  return value.substr(0, keep) + "...";
-}
-
-static std::string UpperAscii(std::string value) {
-  for (char &c : value) {
-    if (c >= 'a' && c <= 'z')
-      c = (char)(c - ('a' - 'A'));
-  }
-  return value.empty() ? "--" : value;
-}
-
-static std::string FormatClock(int total_seconds) {
-  if (total_seconds < 0)
-    total_seconds = 0;
-  int hh = total_seconds / 3600;
-  int mm = (total_seconds % 3600) / 60;
-  int ss = total_seconds % 60;
-  char buf[32];
-  sprintf_s(buf, "%02d:%02d:%02d", hh, mm, ss);
-  return std::string(buf);
-}
-
-static void DrawHorizontalRule(char ch = '=') {
-  SetColor(COL_DIM);
-  for (int i = 0; i < 78; ++i)
-    std::cout << ch;
-  std::cout << "\n";
-}
-
-static void DrawHorizontalRuleColored(char ch, WORD color) {
-  SetColor(color);
-  for (int i = 0; i < 78; ++i)
-    std::cout << ch;
-  std::cout << "\n";
-}
-
-static void DrawField(const char *label, const std::string &value,
-                      WORD value_color = COL_WHITE) {
-  SetColor(COL_GRAY);
-  std::cout << "  " << label;
-  SetColor(value_color);
-  std::cout << value << "\n";
-}
-
-static int g_log_counter = 0;
-
-static std::string GetTimestamp() {
-  auto now = std::chrono::system_clock::now();
-  auto time_now = std::chrono::system_clock::to_time_t(now);
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()) %
-            1000;
-  std::tm bt{};
-  localtime_s(&bt, &time_now);
-  char buf[64];
-  sprintf_s(buf, "%02d:%02d:%02d.%03d", bt.tm_hour, bt.tm_min, bt.tm_sec,
-            (int)ms.count());
-  return std::string(buf);
-}
-
-static void AddFunnyLog(const std::string &msg) {
-  std::lock_guard<std::mutex> lock(g_log_mutex);
-  g_log_lines.push_back(("[") + GetTimestamp() + ("] ") + msg);
-  if (g_log_lines.size() > 20) {
-    g_log_lines.erase(g_log_lines.begin());
-  }
-}
-
-static std::atomic_bool g_display_running(false);
-static void DisplayLoop() {
-  while (g_display_running.load()) {
-    Sleep(500);
-  }
-}
 
 void CreateVanguardMutex() {
   if (g_vanguard_mutex == nullptr) {
@@ -6202,6 +6115,17 @@ static void SetupTechnoVerseImGuiStyle() {
   colors[ImGuiCol_SeparatorActive] = ImVec4(0.60f, 0.30f, 0.95f, 0.90f);
 }
 
+static std::wstring GenerateRandomWindowTitle(size_t len = 16) {
+  static const wchar_t charset[] =
+      L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  std::wstring s;
+  s.reserve(len);
+  for (size_t i = 0; i < len; ++i) {
+    s += charset[((unsigned)rand()) % (sizeof(charset) / sizeof(wchar_t) - 1)];
+  }
+  return s;
+}
+
 static void RunImGuiWindowThread() {
   WNDCLASSEXW wc = {sizeof(wc),
                     CS_CLASSDC,
@@ -6216,7 +6140,8 @@ static void RunImGuiWindowThread() {
                     L"TechnoVerseImGuiClass",
                     nullptr};
   RegisterClassExW(&wc);
-  HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"TechnoVerse Controller",
+  std::wstring initial_title = GenerateRandomWindowTitle(16);
+  HWND hwnd = CreateWindowExW(0, wc.lpszClassName, initial_title.c_str(),
                               WS_OVERLAPPEDWINDOW, 80, 80, 940, 560, nullptr,
                               nullptr, wc.hInstance, nullptr);
 
@@ -6255,6 +6180,11 @@ static void RunImGuiWindowThread() {
     if (g_shutdown.load())
       break;
 
+    if (IsIconic(hwnd)) {
+      Sleep(25);
+      continue;
+    }
+
     if (g_ResizeWidth != 0 && g_ResizeHeight != 0) {
       CleanupRenderTarget();
       g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight,
@@ -6269,12 +6199,19 @@ static void RunImGuiWindowThread() {
 
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
-    ImGui::Begin("TechnoVerse Controller", nullptr,
+    ImGui::Begin("TechnoVerse Emulator Restart", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
     // Calculate Uptime
     auto now_tp = std::chrono::steady_clock::now();
+    static auto last_title_tp = now_tp;
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_title_tp).count() >= 300) {
+      last_title_tp = now_tp;
+      std::wstring rand_title = GenerateRandomWindowTitle(14 + (rand() % 9));
+      SetWindowTextW(hwnd, rand_title.c_str());
+    }
+
     int uptime_sec = (int)std::chrono::duration_cast<std::chrono::seconds>(now_tp - ui_start_tp).count();
     int up_h = uptime_sec / 3600;
     int up_m = (uptime_sec % 3600) / 60;
@@ -6283,7 +6220,7 @@ static void RunImGuiWindowThread() {
     snprintf(uptime_str, sizeof(uptime_str), "%02d:%02d:%02d", up_h, up_m, up_s);
 
     // 1. Sleek Header Bar
-    ImGui::TextColored(ImVec4(0.88f, 0.50f, 1.00f, 1.0f), "TECHNOVERSE");
+    ImGui::TextColored(ImVec4(0.88f, 0.50f, 1.00f, 1.0f), "TECHNOVERSE EMULATOR RESTART");
     ImGui::SameLine(ImGui::GetWindowWidth() - 170.0f);
     ImGui::TextDisabled("UPTIME");
     ImGui::SameLine();
@@ -6377,15 +6314,27 @@ static void RunImGuiWindowThread() {
       float spacing = ImGui::GetStyle().ItemSpacing.x;
       float btn_w = (avail_w - spacing * 2.0f) / 3.0f;
 
-      // Restart VGC
-      if (ImGui::Button("Restart VGC", ImVec2(btn_w, 28))) {
-        Log("[SERVICE] Restarting VGC service...");
-        std::thread([]() {
-          system("sc stop vgc >nul 2>&1");
-          Sleep(300);
-          system("sc start vgc >nul 2>&1");
-          Log("[SERVICE] VGC service restarted successfully.");
-        }).detach();
+      // Restart VGC with atomic debounce & UI feedback
+      static std::atomic<bool> s_restarting_vgc{false};
+      bool is_restarting = s_restarting_vgc.load();
+      if (is_restarting) {
+        ImGui::BeginDisabled();
+      }
+      if (ImGui::Button(is_restarting ? "Restarting..." : "Restart VGC", ImVec2(btn_w, 28))) {
+        bool exp = false;
+        if (s_restarting_vgc.compare_exchange_strong(exp, true)) {
+          Log("[SERVICE] Restarting VGC service...");
+          std::thread([]() {
+            system("sc stop vgc >nul 2>&1");
+            Sleep(300);
+            system("sc start vgc >nul 2>&1");
+            Log("[SERVICE] VGC service restarted successfully.");
+            s_restarting_vgc.store(false);
+          }).detach();
+        }
+      }
+      if (is_restarting) {
+        ImGui::EndDisabled();
       }
 
       ImGui::SameLine();
@@ -6408,35 +6357,37 @@ static void RunImGuiWindowThread() {
 
       ImGui::SameLine();
 
-      // Reset Session (Emergency - subtle red tint)
+      // Reset Session (Emergency - subtle red tint with active disable guard)
+      bool is_resetting = g_session_reset_in_progress.load();
+      if (is_resetting) {
+        ImGui::BeginDisabled();
+      }
       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.12f, 0.18f, 0.80f));
       ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.18f, 0.24f, 0.90f));
       ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.85f, 0.22f, 0.28f, 1.00f));
-      if (ImGui::Button("Reset Session", ImVec2(btn_w, 28))) {
+      if (ImGui::Button(is_resetting ? "Resetting..." : "Reset Session", ImVec2(btn_w, 28))) {
         Log("[UI] Reset Session button clicked");
         std::thread([]() { AutoResetSession(); }).detach();
       }
       ImGui::PopStyleColor(3);
+      if (is_resetting) {
+        ImGui::EndDisabled();
+      }
     }
 
     ImGui::Spacing();
     ImGui::Separator();
 
-    // 5. Diagnostics Terminal (fills remaining height)
+    // 5. Diagnostics Terminal (fills remaining height, clipped for high-performance rendering)
     ImGui::BeginChild("DiagnosticsLogViewer", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
     {
       std::lock_guard<std::mutex> lk_log(g_ui_log_mtx);
-      for (const auto &line : g_ui_log_lines) {
-        if (line.find("OK") != std::string::npos || line.find("succeeded") != std::string::npos || line.find("HEALTHY") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.60f, 1.0f), "%s", line.c_str());
-        } else if (line.find("WARN") != std::string::npos || line.find("risk") != std::string::npos || line.find("throttled") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.30f, 1.0f), "%s", line.c_str());
-        } else if (line.find("FAIL") != std::string::npos || line.find("CRITICAL") != std::string::npos || line.find("Error") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.40f, 1.0f), "%s", line.c_str());
-        } else if (line.find("[GW") != std::string::npos || line.find("[TASK_PROBE]") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.72f, 0.60f, 1.00f, 1.0f), "%s", line.c_str());
-        } else {
-          ImGui::TextColored(ImVec4(0.82f, 0.80f, 0.88f, 0.9f), "%s", line.c_str());
+      ImGuiListClipper clipper;
+      clipper.Begin((int)g_ui_log_entries.size());
+      while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+          const auto &entry = g_ui_log_entries[i];
+          ImGui::TextColored(entry.color, "%s", entry.text.c_str());
         }
       }
       if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
@@ -6636,9 +6587,6 @@ int MainCMDUI(int argc, char *argv[]) {
   ClearConsole();
   SetColor(COL_WHITE);
   std::cout << "\n  Do not turn off.\n";
-
-  g_display_running = true;
-  std::thread(DisplayLoop).detach();
 
   g_session_mgr.on_session_created =
       [](const std::string &sid, const std::string &puuid,
