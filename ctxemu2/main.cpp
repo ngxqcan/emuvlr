@@ -1,6 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
 #define SECURITY_WIN32
-#include "mfa.h"
 #include "vanguard_gateway.h"
 #include "winternl.h"
 #include <Shlwapi.h>
@@ -70,9 +69,44 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Advapi32.lib")
 
+static std::string GetConfigFilePath() {
+  char exe_path[MAX_PATH] = {0};
+  if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
+    char *last_slash = strrchr(exe_path, '\\');
+    if (last_slash) {
+      *(last_slash + 1) = '\0';
+      return std::string(exe_path) + "region.cfg";
+    }
+  }
+  return "region.cfg";
+}
+
+static void SaveRegionSetting(const std::string &region) {
+  std::ofstream f(GetConfigFilePath(), std::ios::trunc);
+  if (f.is_open()) {
+    f << region;
+    f.close();
+  }
+}
+
+static std::string LoadRegionSetting() {
+  std::ifstream f(GetConfigFilePath());
+  if (f.is_open()) {
+    std::string region;
+    if (f >> region) {
+      if (region == "ap" || region == "br" || region == "eu" ||
+          region == "kr" || region == "la" || region == "na") {
+        return region;
+      }
+    }
+    f.close();
+  }
+  return "ap";
+}
+
 bool authenticatedsession = false;
 HANDLE g_vanguard_mutex = nullptr;
-static std::string g_selected_region = "ap";
+static std::string g_selected_region = LoadRegionSetting();
 HANDLE g_vanguard_shared_memory = nullptr;
 std::atomic<bool> g_session_reset_needed{false};
 std::atomic<int> g_102_count{0};
@@ -5661,147 +5695,6 @@ BOOL WINAPI CtrlHandler(DWORD t) {
 
 std::atomic_bool shutdown_event(false);
 
-// ─── ShooterGame.log Monitor Thread ────────────────────────────────────────
-static std::atomic<long long> g_log_last_pos(0);
-
-static std::string get_shooter_log_path() {
-  char localapp[MAX_PATH] = {};
-  GetEnvironmentVariableA(xorstr_("LOCALAPPDATA"), localapp, MAX_PATH);
-  return std::string(localapp) +
-         xorstr_("\\VALORANT\\Saved\\Logs\\ShooterGame.log");
-}
-
-static void shooter_log_monitor_thread() {
-  const std::string log_path = get_shooter_log_path();
-  Log("[SHOOTER_LOG] Monitor thread initialized watching: " + log_path);
-
-  bool first_attach_logged = false;
-  {
-    std::ifstream f(log_path, std::ios::binary | std::ios::ate);
-    if (f.is_open()) {
-      g_log_last_pos.store((long long)f.tellg());
-      Log("[SHOOTER_LOG] Existing ShooterGame.log found (size: " +
-          std::to_string(g_log_last_pos.load()) + " bytes) -> tailing new events...");
-      first_attach_logged = true;
-    }
-  }
-
-  static const char *MATCH_END_KW[] = {"MatchDetails",
-                                       "match-details",
-                                       "postmatch",
-                                       "PostMatch",
-                                       "GameFinished",
-                                       "GameEnd",
-                                       "UnregisteringPlayer",
-                                       "LeavingMatch",
-                                       "MatchHistory",
-                                       "game_finished",
-                                       "Leaving state: InGame",
-                                       "PostGame",
-                                       nullptr};
-
-  static const char *DODGE_KW[] = {
-      "Pregame_Destroy",    "Pregame_Leave",         "Pregame_Quit",
-      "Pregame_Dodge",      "Pregame_State_Destroy", "Leaving state: PreGame",
-      "Matchmaking_Cancel", "PreGame -> Lobby",      nullptr};
-
-  static ULONGLONG last_gateway_refresh_ms = 0;
-
-  auto trigger_lobby_gateway_refresh = [](const char *reason) {
-    std::string jwt, puuid;
-    {
-      std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-      jwt = g_cached_jwt;
-      puuid = g_cached_puuid;
-    }
-    if (jwt.empty() || puuid.empty()) {
-      return;
-    }
-    ULONGLONG now = GetTickCount64();
-    if (last_gateway_refresh_ms != 0 &&
-        (now - last_gateway_refresh_ms) < 15000) {
-      return;
-    }
-    last_gateway_refresh_ms = now;
-    Log(std::string("[SHOOTER_LOG][EVENT] ") + reason +
-        " detected -> triggering proactive Gateway keepalive refresh");
-    restore_time();
-    TriggerGatewayAutoRefreshAction();
-  };
-
-  while (!shutdown_event.load()) {
-    Sleep(500);
-
-    long long cur_size = 0;
-    {
-      std::ifstream f(log_path, std::ios::binary | std::ios::ate);
-      if (!f.is_open())
-        continue;
-      cur_size = (long long)f.tellg();
-    }
-
-    if (!first_attach_logged && cur_size > 0) {
-      Log("[SHOOTER_LOG] Valorant launched -> Successfully attached to ShooterGame.log (" +
-          std::to_string(cur_size) + " bytes)");
-      first_attach_logged = true;
-    }
-
-    long long last_pos = g_log_last_pos.load();
-    if (cur_size < last_pos) {
-      Log("[SHOOTER_LOG] ShooterGame.log truncated/rotated -> resetting read cursor");
-      g_log_last_pos.store(0);
-      last_pos = 0;
-    }
-    if (cur_size == last_pos)
-      continue;
-
-    long long to_read = cur_size - last_pos;
-    if (to_read > 512 * 1024) {
-      g_log_last_pos.store(cur_size);
-      continue;
-    }
-
-    std::string raw((size_t)to_read, '\0');
-    {
-      std::ifstream f(log_path, std::ios::binary);
-      if (!f.is_open())
-        continue;
-      f.seekg(last_pos);
-      f.read(&raw[0], to_read);
-    }
-    g_log_last_pos.store(cur_size);
-
-    std::istringstream iss(raw);
-    std::string line;
-    while (std::getline(iss, line)) {
-      if (line.find(xorstr_("Pregame_LockCharacter")) != std::string::npos) {
-        Log("[SHOOTER_LOG][EVENT] Agent locked in PreGame -> preparing match connection & sync clock");
-        restore_time();
-      }
-
-      if (line.find(xorstr_("Entering state: InGame")) != std::string::npos ||
-          line.find(xorstr_("TravelURL: /Game/Maps/")) != std::string::npos) {
-        Log("[SHOOTER_LOG][EVENT] Map loading / Entering InGame match state");
-        g_round_tracker.on_match_start();
-      }
-
-      for (int i = 0; DODGE_KW[i]; ++i) {
-        if (line.find(DODGE_KW[i]) != std::string::npos) {
-          trigger_lobby_gateway_refresh("Agent select dodge / matchmaking cancel");
-          break;
-        }
-      }
-
-      for (int i = 0; MATCH_END_KW[i]; ++i) {
-        if (line.find(MATCH_END_KW[i]) != std::string::npos) {
-          trigger_lobby_gateway_refresh("Match ended -> Returning to Lobby");
-          break;
-        }
-      }
-    }
-  }
-}
-
 static void adjust_privileges() {
   HANDLE hToken;
   TOKEN_PRIVILEGES tp;
@@ -6128,8 +6021,6 @@ static std::string SelectRegionMenu() {
   std::cout << "      SELECT YOUR REGION" << std::endl;
   std::cout << "          TechnoVerse" << std::endl;
   std::cout << "  ==============================\n" << std::endl;
-  SetColor(COL_ORANGE);
-  std::cout << "  [0] MFA Bypass (Account Verify)" << std::endl;
   SetColor(COL_WHITE);
   std::cout << "  [1] AP     (Asia Pacific)" << std::endl;
   std::cout << "  [2] BR     (Brazil)" << std::endl;
@@ -6140,7 +6031,7 @@ static std::string SelectRegionMenu() {
   SetColor(COL_CYAN);
   std::cout << "\n  ==============================\n" << std::endl;
   SetColor(COL_GRAY);
-  std::cout << "  Enter choice (0-6): ";
+  std::cout << "  Enter choice (1-6): ";
   SetColor(COL_WHITE);
 
   int choice = 0;
@@ -6149,45 +6040,30 @@ static std::string SelectRegionMenu() {
   if (!input.empty())
     choice = atoi(input.c_str());
 
-  if (choice == 0) {
-    mfa::on_msg = [](int type, const char *s) {
-      if (type == 1) {
-        SetColor(COL_GREEN);
-        std::cout << "\n  [MFA] " << s << "\n";
-      } else if (type == 2) {
-        SetColor(COL_RED);
-        std::cout << "\n  [MFA] " << s << "\n";
-      } else {
-        SetColor(COL_GRAY);
-        std::cout << "\n  [MFA] " << s << "\n";
-      }
-      SetColor(COL_WHITE);
-    };
-    SetColor(COL_ORANGE);
-    std::cout << "\n  MFA Bypass starting...\n";
-    SetColor(COL_WHITE);
-    mfa::RequestRun();
-    Sleep(3000);
-    return SelectRegionMenu();
-  }
-
   switch (choice) {
   case 1:
+    SaveRegionSetting("ap");
     return "ap";
   case 2:
+    SaveRegionSetting("br");
     return "br";
   case 3:
+    SaveRegionSetting("eu");
     return "eu";
   case 4:
+    SaveRegionSetting("kr");
     return "kr";
   case 5:
+    SaveRegionSetting("la");
     return "la";
   case 6:
+    SaveRegionSetting("na");
     return "na";
   default:
     SetColor(COL_RED);
     std::cout << "\n  Invalid choice, defaulting to EU.\n";
     Sleep(1500);
+    SaveRegionSetting("eu");
     return "eu";
   }
 }
@@ -6277,49 +6153,53 @@ static void SetupTechnoVerseImGuiStyle() {
   ImGuiStyle &style = ImGui::GetStyle();
   ImVec4 *colors = style.Colors;
 
-  style.WindowRounding = 14.0f;
-  style.ChildRounding = 10.0f;
-  style.FrameRounding = 8.0f;
-  style.PopupRounding = 10.0f;
-  style.ScrollbarRounding = 8.0f;
-  style.GrabRounding = 8.0f;
-  style.TabRounding = 8.0f;
-  style.WindowPadding = ImVec2(18.0f, 16.0f);
-  style.FramePadding = ImVec2(12.0f, 7.0f);
-  style.ItemSpacing = ImVec2(10.0f, 8.0f);
-  style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
-  style.ScrollbarSize = 12.0f;
+  style.WindowRounding = 6.0f;
+  style.ChildRounding = 5.0f;
+  style.FrameRounding = 4.0f;
+  style.PopupRounding = 5.0f;
+  style.ScrollbarRounding = 4.0f;
+  style.GrabRounding = 4.0f;
+  style.TabRounding = 4.0f;
+  style.WindowBorderSize = 0.0f;
+  style.ChildBorderSize = 1.0f;
+  style.FrameBorderSize = 0.0f;
+  style.WindowPadding = ImVec2(16.0f, 14.0f);
+  style.FramePadding = ImVec2(10.0f, 6.0f);
+  style.ItemSpacing = ImVec2(8.0f, 7.0f);
+  style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
+  style.ScrollbarSize = 10.0f;
 
-  colors[ImGuiCol_Text] = ImVec4(0.96f, 0.95f, 1.00f, 1.00f);
-  colors[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.50f, 0.70f, 1.00f);
-  colors[ImGuiCol_WindowBg] = ImVec4(0.035f, 0.025f, 0.075f, 0.98f);
-  colors[ImGuiCol_ChildBg] = ImVec4(0.065f, 0.045f, 0.135f, 0.95f);
-  colors[ImGuiCol_PopupBg] = ImVec4(0.07f, 0.05f, 0.15f, 0.98f);
-  colors[ImGuiCol_Border] = ImVec4(0.48f, 0.20f, 0.85f, 0.50f);
+  // Preserve signature deep obsidian & cyber-purple palette
+  colors[ImGuiCol_Text] = ImVec4(0.94f, 0.92f, 0.98f, 1.00f);
+  colors[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.46f, 0.62f, 1.00f);
+  colors[ImGuiCol_WindowBg] = ImVec4(0.035f, 0.025f, 0.075f, 1.00f);
+  colors[ImGuiCol_ChildBg] = ImVec4(0.060f, 0.045f, 0.120f, 0.65f);
+  colors[ImGuiCol_PopupBg] = ImVec4(0.070f, 0.050f, 0.140f, 0.98f);
+  colors[ImGuiCol_Border] = ImVec4(0.24f, 0.16f, 0.38f, 0.45f);
   colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-  colors[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.06f, 0.20f, 1.00f);
-  colors[ImGuiCol_FrameBgHovered] = ImVec4(0.22f, 0.12f, 0.42f, 1.00f);
-  colors[ImGuiCol_FrameBgActive] = ImVec4(0.32f, 0.18f, 0.58f, 1.00f);
-  colors[ImGuiCol_TitleBg] = ImVec4(0.05f, 0.03f, 0.10f, 1.00f);
-  colors[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.06f, 0.20f, 1.00f);
+  colors[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.07f, 0.18f, 0.70f);
+  colors[ImGuiCol_FrameBgHovered] = ImVec4(0.20f, 0.12f, 0.36f, 0.85f);
+  colors[ImGuiCol_FrameBgActive] = ImVec4(0.30f, 0.16f, 0.52f, 1.00f);
+  colors[ImGuiCol_TitleBg] = ImVec4(0.04f, 0.03f, 0.08f, 1.00f);
+  colors[ImGuiCol_TitleBgActive] = ImVec4(0.07f, 0.05f, 0.14f, 1.00f);
   colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.04f, 0.03f, 0.08f, 0.75f);
-  colors[ImGuiCol_MenuBarBg] = ImVec4(0.07f, 0.05f, 0.14f, 1.00f);
-  colors[ImGuiCol_ScrollbarBg] = ImVec4(0.04f, 0.03f, 0.08f, 0.50f);
-  colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.28f, 0.15f, 0.52f, 1.00f);
-  colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.42f, 0.22f, 0.72f, 1.00f);
-  colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.58f, 0.28f, 0.92f, 1.00f);
-  colors[ImGuiCol_CheckMark] = ImVec4(0.80f, 0.35f, 1.00f, 1.00f);
-  colors[ImGuiCol_SliderGrab] = ImVec4(0.70f, 0.30f, 1.00f, 1.00f);
-  colors[ImGuiCol_SliderGrabActive] = ImVec4(0.85f, 0.42f, 1.00f, 1.00f);
-  colors[ImGuiCol_Button] = ImVec4(0.18f, 0.10f, 0.36f, 1.00f);
-  colors[ImGuiCol_ButtonHovered] = ImVec4(0.35f, 0.18f, 0.65f, 1.00f);
-  colors[ImGuiCol_ButtonActive] = ImVec4(0.55f, 0.25f, 0.95f, 1.00f);
-  colors[ImGuiCol_Header] = ImVec4(0.20f, 0.12f, 0.38f, 1.00f);
-  colors[ImGuiCol_HeaderHovered] = ImVec4(0.35f, 0.18f, 0.65f, 1.00f);
-  colors[ImGuiCol_HeaderActive] = ImVec4(0.55f, 0.25f, 0.95f, 1.00f);
-  colors[ImGuiCol_Separator] = ImVec4(0.35f, 0.18f, 0.62f, 0.70f);
-  colors[ImGuiCol_SeparatorHovered] = ImVec4(0.55f, 0.25f, 0.95f, 1.00f);
-  colors[ImGuiCol_SeparatorActive] = ImVec4(0.75f, 0.35f, 1.00f, 1.00f);
+  colors[ImGuiCol_MenuBarBg] = ImVec4(0.06f, 0.04f, 0.12f, 1.00f);
+  colors[ImGuiCol_ScrollbarBg] = ImVec4(0.03f, 0.02f, 0.06f, 0.35f);
+  colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.25f, 0.16f, 0.44f, 0.75f);
+  colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.38f, 0.22f, 0.65f, 0.85f);
+  colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.55f, 0.28f, 0.90f, 1.00f);
+  colors[ImGuiCol_CheckMark] = ImVec4(0.80f, 0.38f, 1.00f, 1.00f);
+  colors[ImGuiCol_SliderGrab] = ImVec4(0.65f, 0.28f, 0.92f, 1.00f);
+  colors[ImGuiCol_SliderGrabActive] = ImVec4(0.80f, 0.38f, 1.00f, 1.00f);
+  colors[ImGuiCol_Button] = ImVec4(0.12f, 0.08f, 0.22f, 0.85f);
+  colors[ImGuiCol_ButtonHovered] = ImVec4(0.26f, 0.15f, 0.46f, 0.95f);
+  colors[ImGuiCol_ButtonActive] = ImVec4(0.48f, 0.22f, 0.82f, 1.00f);
+  colors[ImGuiCol_Header] = ImVec4(0.18f, 0.11f, 0.32f, 0.80f);
+  colors[ImGuiCol_HeaderHovered] = ImVec4(0.30f, 0.17f, 0.52f, 0.90f);
+  colors[ImGuiCol_HeaderActive] = ImVec4(0.50f, 0.24f, 0.86f, 1.00f);
+  colors[ImGuiCol_Separator] = ImVec4(0.20f, 0.14f, 0.32f, 0.55f);
+  colors[ImGuiCol_SeparatorHovered] = ImVec4(0.40f, 0.22f, 0.70f, 0.75f);
+  colors[ImGuiCol_SeparatorActive] = ImVec4(0.60f, 0.30f, 0.95f, 0.90f);
 }
 
 static void RunImGuiWindowThread() {
@@ -6336,7 +6216,7 @@ static void RunImGuiWindowThread() {
                     L"TechnoVerseImGuiClass",
                     nullptr};
   RegisterClassExW(&wc);
-  HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"TechnoVerse Controller - 4H Session Engine",
+  HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"TechnoVerse Controller",
                               WS_OVERLAPPEDWINDOW, 80, 80, 940, 560, nullptr,
                               nullptr, wc.hInstance, nullptr);
 
@@ -6402,73 +6282,47 @@ static void RunImGuiWindowThread() {
     char uptime_str[64];
     snprintf(uptime_str, sizeof(uptime_str), "%02d:%02d:%02d", up_h, up_m, up_s);
 
-    // Header Bar
-    ImGui::TextColored(ImVec4(0.85f, 0.45f, 1.00f, 1.0f), "TECHNOVERSE");
-    ImGui::SameLine();
-    ImGui::TextDisabled("| 4-Hour Vanguard Session Engine");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 220);
-    ImGui::TextDisabled("UPTIME:");
+    // 1. Sleek Header Bar
+    ImGui::TextColored(ImVec4(0.88f, 0.50f, 1.00f, 1.0f), "TECHNOVERSE");
+    ImGui::SameLine(ImGui::GetWindowWidth() - 170.0f);
+    ImGui::TextDisabled("UPTIME");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.65f, 1.0f), "%s", uptime_str);
 
     ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
 
-    // 1. Status Dashboard Panel (4 columns)
-    ImGui::BeginChild("StatusPanel", ImVec2(0, 80), true);
+    // 2. Minimalist Status Bar (clean flat card)
+    ImGui::BeginChild("StatusStrip", ImVec2(0, 42), true, ImGuiWindowFlags_NoScrollbar);
     {
-      ImGui::Columns(4, "StatusCols", false);
+      ImGui::Columns(2, "StatusCols", false);
 
-      // Col 1: Valorant Process & Match State
-      ImGui::TextDisabled("VALORANT PROCESS");
+      // Col 1: Valorant Process
+      ImGui::TextDisabled("PROCESS");
+      ImGui::SameLine();
       if (g_valorant_pid != 0) {
         if (g_round_tracker.is_in_match()) {
-          ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.50f, 1.0f), "[ MATCH R#%d ]", g_round_tracker.current_round());
+          ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.50f, 1.0f), "Match R#%d", g_round_tracker.current_round());
         } else {
-          ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.95f, 1.0f), "[ LOBBY (PID:%d) ]", g_valorant_pid);
+          ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.95f, 1.0f), "Lobby (%d)", g_valorant_pid);
         }
       } else {
-        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.45f, 1.0f), "[ WAITING... ]");
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.45f, 1.0f), "Waiting...");
       }
       ImGui::NextColumn();
 
-      // Col 2: Active Server Region & Host
-      ImGui::TextDisabled("ACTIVE REGION");
-      ImGui::TextColored(ImVec4(0.78f, 0.45f, 1.00f, 1.0f), "[ %s ]",
-                         RegionDisplayName(g_selected_region).c_str());
-      ImGui::NextColumn();
-
-      // Col 3: 4-Hour Session Health & VAL 102 Protection
-      ImGui::TextDisabled("SESSION HEALTH (VAL 102)");
-      int err102 = g_102_count.load();
-      if (err102 == 0) {
-        ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.50f, 1.0f), "[ 100%% HEALTHY ]");
-      } else if (err102 < 3) {
-        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "[ RECOVERY (R:%d) ]", err102);
-      } else {
-        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.35f, 1.0f), "[ RESET NEEDED ]");
-      }
-      ImGui::NextColumn();
-
-      // Col 4: Task Engine & Keepalive Timer
-      ImGui::TextDisabled("KEEPALIVE & TASKS");
-      int rem_reauth = 0;
-      int rem_m = (rem_reauth > 0) ? (rem_reauth / 60) : 0;
-      int rem_s = (rem_reauth > 0) ? (rem_reauth % 60) : 0;
-      int ack_count = 0;
-      {
-        std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
-        ack_count = (int)g_task_probe_queue.acked_task_ids.size();
-      }
-      ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.95f, 1.0f), "[ %02dm%02ds | ACK:%d ]", rem_m, rem_s, ack_count);
+      // Col 2: Region
+      ImGui::TextDisabled("REGION");
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(0.82f, 0.55f, 1.00f, 1.0f), "%s", RegionDisplayName(g_selected_region).c_str());
       ImGui::Columns(1);
     }
     ImGui::EndChild();
 
     ImGui::Spacing();
 
-    // 2. Select Server Region
-    ImGui::TextColored(ImVec4(0.88f, 0.82f, 1.00f, 1.0f), "SELECT SERVER REGION");
-    ImGui::BeginChild("RegionGrid", ImVec2(0, 52), true);
+    // 3. Compact Region Selection Row
     {
       struct RegionBtnInfo {
         const char *code;
@@ -6478,27 +6332,25 @@ static void RunImGuiWindowThread() {
                                               {"eu", "EU (Europe)"},  {"kr", "KR (Korea)"},
                                               {"la", "LATAM"},        {"na", "NA (North America)"}};
 
+      float avail_w = ImGui::GetContentRegionAvail().x;
+      float spacing = ImGui::GetStyle().ItemSpacing.x;
+      float btn_w = (avail_w - spacing * 5.0f) / 6.0f;
+
       for (int i = 0; i < 6; i++) {
         bool isSelected = (g_selected_region == regions[i].code);
-
         if (isSelected) {
-          ImGui::PushStyleColor(ImGuiCol_Button,
-                                ImVec4(0.58f, 0.20f, 0.95f, 1.0f));
-          ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                ImVec4(0.70f, 0.30f, 1.00f, 1.0f));
-          ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                ImVec4(0.48f, 0.15f, 0.82f, 1.0f));
+          ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.20f, 0.92f, 1.0f));
+          ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.68f, 0.28f, 0.98f, 1.0f));
+          ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.45f, 0.15f, 0.80f, 1.0f));
         } else {
-          ImGui::PushStyleColor(ImGuiCol_Button,
-                                ImVec4(0.14f, 0.08f, 0.28f, 1.0f));
-          ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                ImVec4(0.26f, 0.15f, 0.48f, 1.0f));
-          ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                ImVec4(0.55f, 0.18f, 0.92f, 1.0f));
+          ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.09f, 0.06f, 0.16f, 0.80f));
+          ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.12f, 0.35f, 0.85f));
+          ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.35f, 0.18f, 0.60f, 1.0f));
         }
 
-        if (ImGui::Button(regions[i].label, ImVec2(142, 34))) {
+        if (ImGui::Button(regions[i].label, ImVec2(btn_w, 28))) {
           g_selected_region = regions[i].code;
+          SaveRegionSetting(g_selected_region);
           {
             std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
             g_region_override = g_selected_region;
@@ -6511,39 +6363,22 @@ static void RunImGuiWindowThread() {
           Log("[REGION] Selected region updated to: " + g_selected_region +
               " (" + RegionDisplayName(g_selected_region) + ")");
         }
-
         ImGui::PopStyleColor(3);
 
-        if (i < 5) {
-          ImGui::SameLine();
-        }
+        if (i < 5) ImGui::SameLine();
       }
     }
-    ImGui::EndChild();
 
     ImGui::Spacing();
 
-    // 3. Quick Actions Bar
-    ImGui::TextColored(ImVec4(0.88f, 0.82f, 1.00f, 1.0f), "QUICK CONTROLS & ACTIONS");
-    ImGui::BeginChild("ActionButtons", ImVec2(0, 56), true);
+    // 4. Quick Action Controls (sleek uniform toolbar)
     {
-      // MFA Bypass
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.18f, 0.82f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.95f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.60f, 0.12f, 0.70f, 1.0f));
-      if (ImGui::Button("MFA Bypass", ImVec2(130, 36))) {
-        Log("[MFA] Triggering MFA Bypass...");
-        mfa::RequestRun();
-      }
-      ImGui::PopStyleColor(3);
-
-      ImGui::SameLine();
+      float avail_w = ImGui::GetContentRegionAvail().x;
+      float spacing = ImGui::GetStyle().ItemSpacing.x;
+      float btn_w = (avail_w - spacing * 2.0f) / 3.0f;
 
       // Restart VGC
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.38f, 0.18f, 0.82f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.50f, 0.25f, 0.95f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.28f, 0.12f, 0.70f, 1.0f));
-      if (ImGui::Button("Restart VGC", ImVec2(130, 36))) {
+      if (ImGui::Button("Restart VGC", ImVec2(btn_w, 28))) {
         Log("[SERVICE] Restarting VGC service...");
         std::thread([]() {
           system("sc stop vgc >nul 2>&1");
@@ -6552,71 +6387,56 @@ static void RunImGuiWindowThread() {
           Log("[SERVICE] VGC service restarted successfully.");
         }).detach();
       }
-      ImGui::PopStyleColor(3);
-
-      ImGui::SameLine();
-
-      // Local Mode Status (Gateway Disabled)
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.55f, 0.35f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.65f, 0.42f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.08f, 0.45f, 0.28f, 1.0f));
-      if (ImGui::Button("Gateway: OFF", ImVec2(140, 36))) {
-        Log("[GATEWAY] Gateway and Re-auth permanently disabled (Offline Local Mode).");
-      }
-      ImGui::PopStyleColor(3);
 
       ImGui::SameLine();
 
       // Toggle CMD Log
       if (g_console_visible) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.58f, 0.22f, 0.88f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.30f, 0.98f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.45f, 0.15f, 0.75f, 1.0f));
-      } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.14f, 0.38f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.20f, 0.52f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.14f, 0.08f, 0.28f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.18f, 0.68f, 0.90f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.52f, 0.24f, 0.82f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.32f, 0.14f, 0.56f, 1.00f));
       }
-      if (ImGui::Button(g_console_visible ? "Hide CMD" : "Show CMD", ImVec2(130, 36))) {
+      if (ImGui::Button(g_console_visible ? "CMD: Shown" : "CMD: Hidden", ImVec2(btn_w, 28))) {
         g_console_visible = !g_console_visible;
         ToggleConsoleWindowVisibility(g_console_visible);
         Log(std::string("[UI] CMD console window ") +
             (g_console_visible ? "shown" : "hidden"));
       }
-      ImGui::PopStyleColor(3);
+      if (g_console_visible) {
+        ImGui::PopStyleColor(3);
+      }
 
       ImGui::SameLine();
 
-      // Reset Session (Emergency)
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.80f, 0.18f, 0.22f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.92f, 0.28f, 0.32f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.65f, 0.12f, 0.16f, 1.0f));
-      if (ImGui::Button("Reset Session", ImVec2(140, 36))) {
+      // Reset Session (Emergency - subtle red tint)
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.12f, 0.18f, 0.80f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.70f, 0.18f, 0.24f, 0.90f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.85f, 0.22f, 0.28f, 1.00f));
+      if (ImGui::Button("Reset Session", ImVec2(btn_w, 28))) {
         Log("[UI] Reset Session button clicked");
         std::thread([]() { AutoResetSession(); }).detach();
       }
       ImGui::PopStyleColor(3);
     }
-    ImGui::EndChild();
 
     ImGui::Spacing();
+    ImGui::Separator();
 
-    // 4. Built-in Realtime Diagnostics Log Viewer
-    ImGui::TextColored(ImVec4(0.88f, 0.82f, 1.00f, 1.0f), "REALTIME DIAGNOSTICS LOG");
-    ImGui::BeginChild("DiagnosticsLogViewer", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    // 5. Diagnostics Terminal (fills remaining height)
+    ImGui::BeginChild("DiagnosticsLogViewer", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
     {
       std::lock_guard<std::mutex> lk_log(g_ui_log_mtx);
       for (const auto &line : g_ui_log_lines) {
         if (line.find("OK") != std::string::npos || line.find("succeeded") != std::string::npos || line.find("HEALTHY") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.30f, 0.95f, 0.55f, 1.0f), "%s", line.c_str());
+          ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.60f, 1.0f), "%s", line.c_str());
         } else if (line.find("WARN") != std::string::npos || line.find("risk") != std::string::npos || line.find("throttled") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.98f, 0.80f, 0.30f, 1.0f), "%s", line.c_str());
+          ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.30f, 1.0f), "%s", line.c_str());
         } else if (line.find("FAIL") != std::string::npos || line.find("CRITICAL") != std::string::npos || line.find("Error") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.98f, 0.35f, 0.40f, 1.0f), "%s", line.c_str());
+          ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.40f, 1.0f), "%s", line.c_str());
         } else if (line.find("[GW") != std::string::npos || line.find("[TASK_PROBE]") != std::string::npos) {
-          ImGui::TextColored(ImVec4(0.65f, 0.70f, 1.00f, 1.0f), "%s", line.c_str());
+          ImGui::TextColored(ImVec4(0.72f, 0.60f, 1.00f, 1.0f), "%s", line.c_str());
         } else {
-          ImGui::TextUnformatted(line.c_str());
+          ImGui::TextColored(ImVec4(0.82f, 0.80f, 0.88f, 0.9f), "%s", line.c_str());
         }
       }
       if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
@@ -6791,23 +6611,21 @@ int MainCMDUI(int argc, char *argv[]) {
 
   VerifyLicenseKey();
 
-  std::thread(RunImGuiWindowThread).detach();
-
-  g_selected_region = "ap";
+  g_selected_region = LoadRegionSetting();
   {
     std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-    g_region_override = "ap";
-    g_cached_region = "ap";
+    g_region_override = g_selected_region;
+    g_cached_region = g_selected_region;
   }
   std::string title_cmd = "title TechnoVerse - " +
                           RegionDisplayName(g_selected_region) + " VERSION";
   system(title_cmd.c_str());
-  Log("[REGION] Default region display initialized to AP (pending JWT "
-      "auto-detection).");
+  Log("[REGION] Loaded saved region: " + g_selected_region + " (" +
+      RegionDisplayName(g_selected_region) + ")");
+
+  std::thread(RunImGuiWindowThread).detach();
 
   // hostssil();
-  std::thread(shooter_log_monitor_thread).detach();
-
   std::thread killer_thread(vgm_killer_thread);
   killer_thread.detach();
 
@@ -6838,8 +6656,6 @@ int MainCMDUI(int argc, char *argv[]) {
     g_active_session.puuid = "";
     g_active_session.region = "";
   };
-
-  mfa::on_msg = [](int type, const char *s) {};
 
   g_server_running = true;
   std::thread([]() { RunServer(); }).detach();
@@ -6880,9 +6696,6 @@ int MainCMDUI(int argc, char *argv[]) {
     Sleep(500);
     if (g_session_reset_needed.load()) {
       AutoResetSession();
-    }
-    if (GetAsyncKeyState(VK_F8) & 1) {
-      mfa::RequestRun();
     }
     uint32_t current_val_pid = GetValorantPID();
     if (current_val_pid == 0 && g_valorant_pid != 0 &&
