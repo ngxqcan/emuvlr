@@ -1,6 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #define SECURITY_WIN32
-#include "vanguard_gateway.h"
+#include "vgw_core.h"
 #include "winternl.h"
 #include <Shlwapi.h>
 #include <TlHelp32.h>
@@ -33,15 +33,12 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              WPARAM wParam,
                                                              LPARAM lParam);
 
-#include "modules/hb_parse.hpp"
-#include "modules/hb_task_catalog.hpp"
-#include "modules/task_payload_builder.hpp"
-#include "modules/task_result_variants.hpp"
-#include "modules/task_probe_matrix.hpp"
-#include "modules/task_analysis.hpp"
-#include "modules/module_loader.hpp"
-#include "modules/vg_crypto.hpp"
-#include "modules/vg_http.hpp"
+// Inlined helper functions (originally from modules/hb_parse)
+
+static bool looks_like_hb_response_root(const std::vector<uint8_t>& data) {
+    if (data.empty()) return false;
+    return data[0] == 0x08 || data[0] == 0x12 || data[0] == 0x18 || data[0] == 0x22;
+}
 #include <atomic>
 #include <chrono>
 
@@ -126,10 +123,7 @@ static std::mutex g_gw_auth_response_mtx;
 static VGW::GatewaySession g_gw_session;
 static std::mutex g_gw_session_mtx;
 
-static TaskProbeQueue g_task_probe_queue;
-static std::mutex g_task_probe_mtx;
-static std::atomic_bool g_task_probe_dispatcher_running{false};
-static void StartTaskProbeDispatcher();
+
 
 static bool GatewaySendHeartbeat();
 bool g_vgc_service_running = false;
@@ -218,9 +212,6 @@ constexpr int RSA_KEY_SIZE = 3072;
 
 constexpr const char *SERVER_HOST = "127.0.0.1";
 constexpr const char *AUTH_KEY = "";
-constexpr const wchar_t *GW_PATH = L"/vanguard/v1/gateway";
-constexpr INTERNET_PORT GW_PORT = 8443;
-constexpr const wchar_t *VGC_UA = L"vanguard/1.18.5-11+20260805.032431";
 constexpr const wchar_t *PIPE_NAME =
     L"\\\\.\\pipe\\933823D3-C77B-4BAE-89D7-A92B567236BC";
 
@@ -367,160 +358,7 @@ static void Log(const std::string &msg) {
   PushUiLogLine(formatted);
 }
 
-class DataAnalysisManager {
-private:
-  TaskCatalog m_catalog;
-  std::mutex m_mtx;
-  size_t m_total_parsed_count = 0;
-  std::unordered_set<std::string> m_discovered_tasks;
-  std::unordered_set<std::string> m_discovered_modules;
-  std::unordered_set<std::string> m_discovered_cdns;
 
-public:
-  static bool IsValidStructure(const std::vector<uint8_t> &raw_data) {
-    if (raw_data.empty())
-      return false;
-    std::vector<uint8_t> plain = VGW::DecryptGatewayResponse(raw_data);
-    if (plain.empty())
-      plain = raw_data;
-    if (plain.size() < 20)
-      return false;
-    return looks_like_hb_response_root(plain) || plain[0] == 0x08;
-  }
-
-  void ProcessReceivedData(const std::vector<uint8_t> &raw_data,
-                           const std::string &source_label = "gateway") {
-    if (raw_data.size() < MIN_VALID_PAYLOAD_SIZE) {
-      Log("WARNING: Payload too small: " + std::to_string(raw_data.size()) +
-          " bytes");
-      return;
-    }
-    if (!IsValidStructure(raw_data)) {
-      Log("ERROR: Invalid payload structure");
-      return;
-    }
-    try {
-      std::vector<uint8_t> plain = VGW::DecryptGatewayResponse(raw_data);
-      if (plain.empty()) {
-        plain = raw_data;
-      }
-
-      int env_type = 8;
-      if (looks_like_hb_response_root(plain)) {
-        env_type = 8;
-      }
-
-      HbParseResult parsed = parse_hb_plain(plain, env_type);
-
-      std::lock_guard<std::mutex> lock(m_mtx);
-      m_total_parsed_count++;
-
-      TaskCatalog cat = catalog_from_parsed(parsed);
-      m_catalog.merge(cat);
-
-      size_t new_tasks = 0;
-      for (const auto &task : parsed.tasks) {
-        if (task.id_uint.has_value()) {
-          std::string tid = std::to_string(task.id_uint.value());
-          if (m_discovered_tasks.insert(tid).second)
-            new_tasks++;
-        }
-        if (task.module_task.has_value() && !task.module_task->id_str.empty()) {
-          if (m_discovered_tasks.insert(task.module_task->id_str).second)
-            new_tasks++;
-        }
-      }
-
-      size_t new_modules = 0;
-      for (const auto &mod : parsed.modules) {
-        if (!mod.module_id.empty()) {
-          if (m_discovered_modules.insert(mod.module_id).second)
-            new_modules++;
-        }
-      }
-
-      size_t new_cdns = 0;
-      for (const auto &cdn : parsed.cdn_urls) {
-        if (!cdn.empty()) {
-          if (m_discovered_cdns.insert(cdn).second)
-            new_cdns++;
-        }
-      }
-
-      std::ostringstream ss;
-      ss << "[DATA_PARSE][" << source_label << "] Parse #"
-         << m_total_parsed_count << " | Raw: " << raw_data.size()
-         << "B, Plain: " << plain.size() << "B, Slice: " << parsed.slice_bytes
-         << "B"
-         << " | Tasks: " << parsed.tasks.size() << " (New: " << new_tasks
-         << ", Total: " << m_discovered_tasks.size() << ")"
-         << " | Modules: " << parsed.modules.size() << " (New: " << new_modules
-         << ", Total: " << m_discovered_modules.size() << ")"
-         << " | CDN URLs: " << parsed.cdn_urls.size() << " (New: " << new_cdns
-         << ", Total: " << m_discovered_cdns.size() << ")"
-         << " | Disconnect: " << (parsed.should_disconnect ? "YES" : "NO")
-         << " | Fields: [" << parsed.field_summary << "]";
-
-      Log(ss.str());
-
-      if (!parsed.tasks.empty() || !parsed.modules.empty()) {
-        std::string report = format_parse_report(parsed);
-        Log("[DATA_PARSE_REPORT]\n" + report);
-      }
-
-      std::string current_token;
-      std::string current_region = g_selected_region.empty() ? "la" : g_selected_region;
-      std::string current_puuid;
-      std::string current_sid;
-      {
-        std::lock_guard<std::mutex> lk_j(g_jwt_cache_mtx);
-        current_token = g_cached_jwt;
-        current_puuid = g_cached_puuid;
-        current_sid = g_cached_sid;
-        if (!g_cached_region.empty())
-          current_region = g_cached_region;
-      }
-      {
-        std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
-        if (!g_gw_session.token.empty())
-          current_token = g_gw_session.token;
-      }
-
-      std::vector<uint8_t> session_aes(32, 0x5a);
-      std::vector<uint8_t> server_rsa_pub;
-      {
-        std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
-        if (!g_gw_session.server_public_key.empty()) {
-          if (g_gw_session.server_public_key.find("-----BEGIN") != std::string::npos)
-            server_rsa_pub = VGW::PemToDer(g_gw_session.server_public_key);
-          else
-            server_rsa_pub = VGW::Base64Decode(g_gw_session.server_public_key);
-        }
-      }
-
-      {
-        std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
-        g_task_probe_queue.region = current_region;
-        ingest_hb_response(g_task_probe_queue, current_sid.empty() ? "session" : current_sid,
-                           env_type, plain, current_token, session_aes, server_rsa_pub);
-      }
-      StartTaskProbeDispatcher();
-    } catch (const std::exception &e) {
-      Log(std::string("[DATA_PARSE][ERROR] Parsing exception: ") + e.what());
-    } catch (...) {
-      Log("[DATA_PARSE][ERROR] Unknown parsing exception");
-    }
-  }
-
-  TaskCatalog GetCatalog() {
-    std::lock_guard<std::mutex> lock(m_mtx);
-    return m_catalog;
-  }
-
-  size_t GetTotalParsedCount() const { return m_total_parsed_count; }
-};
-
-static DataAnalysisManager g_data_analysis_mgr;
 
 static void PushU32BE(std::vector<uint8_t> &v, uint32_t x) {
   v.push_back((x >> 24) & 0xFF);
@@ -1142,44 +980,7 @@ static std::vector<uint8_t> BuildExpandedDynamicFallbackToken(int hb_count) {
   return token;
 }
 
-static std::atomic<bool> g_hosts_created{false};
 
-void hosts_olustur() {
-  const char *path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
-  const char *icerik = "127.0.0.1 na.vg.ac.pvp.net\n"
-                       "127.0.0.1 eu.vg.ac.pvp.net\n"
-                       "127.0.0.1 eu2.vg.ac.pvp.net\n"
-                       "127.0.0.1 br.vg.ac.pvp.net\n"
-                       "127.0.0.1 latam.vg.ac.pvp.net\n"
-                       "127.0.0.1 kr.vg.ac.pvp.net\n"
-                       "127.0.0.1 ap.vg.ac.pvp.net\n"
-                       "127.0.0.1 data.riotgames.com\n"
-                       "127.0.0.1 telemetry.sgp.pvp.net\n"
-                       "127.0.0.1 player-events.vg.ac.pvp.net\n"
-                       "127.0.0.1 clientlog.riotgames.com\n"
-                       "127.0.0.1 diag.riotgames.com\n"
-                       "127.0.0.1 logger.riotgames.com\n";
-
-  std::ofstream f(path, std::ios::out | std::ios::trunc);
-  if (f.is_open()) {
-    f << icerik;
-    g_hosts_created.store(true);
-  }
-}
-
-void flush_dns_cache() {
-  HMODULE h = LoadLibraryA("dnsapi.dll");
-  if (!h)
-    return;
-  auto fn = (VOID(WINAPI *)())GetProcAddress(h, "DnsFlushResolverCache");
-  if (fn)
-    fn();
-  FreeLibrary(h);
-}
-
-void hostssil() {
-  return; // hostssil temporarily disabled
-}
 
 static std::vector<uint8_t> RealVgkIoctl(uint32_t ioctl_code,
                                          const std::vector<uint8_t> &in_data);
@@ -1901,7 +1702,7 @@ public:
         ss.hb_sequence++;
         ss.hb_last_sent = NowSec();
         if (!resp.empty()) {
-          g_data_analysis_mgr.ProcessReceivedData(resp, "send_heartbeat");
+          Log("[HB] Received gateway data (" + std::to_string(resp.size()) + "B)");
           ss.hb_missed = 0;
           ss.hb_last_success = NowSec();
           ss.hb_success_count++;
@@ -1924,7 +1725,7 @@ public:
             dyn_fallback = std::vector<uint8_t>(FALLBACK_TOKEN, FALLBACK_TOKEN + FALLBACK_TOKEN_LEN);
           }
           resp = dyn_fallback;
-          g_data_analysis_mgr.ProcessReceivedData(resp, "fallback_heartbeat");
+          Log("[HB] Using fallback heartbeat data (" + std::to_string(resp.size()) + "B)");
           ss.hb_missed = 0;
           ss.hb_last_success = NowSec();
           ss.hb_success_count++;
@@ -2029,20 +1830,7 @@ struct TasksModulesHandler {
     std::lock_guard<std::mutex> lk(mtx);
     ack_count++;
 
-    // Scan for potential task hex IDs or strings in pkt to mark in queue
-    if (pkt.size() > 8) {
-      std::string pkt_str(pkt.begin(), pkt.end());
-      std::regex hex_task_re("[0-9a-fA-F]{16,32}");
-      std::sregex_iterator it(pkt_str.begin(), pkt_str.end(), hex_task_re), end;
-      std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
-      while (it != end) {
-        std::string match_tid = it->str();
-        if (looks_like_vanguard_task_id_hex(match_tid)) {
-          g_task_probe_queue.acked_task_ids.insert(match_tid);
-        }
-        ++it;
-      }
-    }
+
 
     // Proper ACK construction based on packet format
     std::vector<uint8_t> ack;
@@ -2158,7 +1946,6 @@ struct PendingGatewayRequest {
 static std::mutex g_pending_gateway_mtx;
 static PendingGatewayRequest g_pending_gateway;
 static uint32_t g_valorant_pid_fwd = 0;
-static void StopVgk();
 struct RandomizedHardwareProfile {
   char cpu_brand[32];
   char cpu_model[128];
@@ -2898,8 +2685,8 @@ static void HandleTunnelClient(SOCKET raw, PCCERT_CONTEXT cert_ctx) {
           }
         }
 
-        g_data_analysis_mgr.ProcessReceivedData(access_resp,
-                                                "MSG_SESSION_ACCESS");
+        Log("[SRV] SESSION_ACCESS received (" + std::to_string(access_resp.size()) + "B)");
+
         std::vector<uint8_t> ok_payload;
         PushLenStr(ok_payload, session_id);
         PushU32BE(ok_payload, (uint32_t)access_resp.size());
@@ -2951,8 +2738,8 @@ static void HandleTunnelClient(SOCKET raw, PCCERT_CONTEXT cert_ctx) {
 
         g_fallback.update(session_id, hb_resp);
         g_session_mgr.send_heartbeat(session_id, true);
-        g_data_analysis_mgr.ProcessReceivedData(hb_resp,
-                                                "MSG_SESSION_HEARTBEAT");
+        Log("[SRV] SESSION_HEARTBEAT received (" + std::to_string(hb_resp.size()) + "B)");
+
 
         std::vector<uint8_t> ok_payload;
         PushLenStr(ok_payload, session_id);
@@ -3095,7 +2882,7 @@ static void RunServer() {
   g_van84_running.store(true);
   std::thread(HeartbeatLoop).detach();
   std::thread(Van84Loop).detach();
-  StartTaskProbeDispatcher();
+
 
   while (g_server_running.load()) {
     sockaddr_in cli_addr{};
@@ -3229,13 +3016,7 @@ static void AutoResetSession() {
   Log("[RESET] Step 5/7: VGC service status: " + GetVgcServiceStatusStr() +
       " (running=" + (g_vgc_service_running ? "true" : "false") + ") - keeping service running to prevent VAN 102");
 
-  // 6. Flush DNS cache twice (with Sleep 500 in between)
-  Log("[RESET] Step 6/7: Flushing DNS cache (pass 1)...");
-  flush_dns_cache();
-  Log("[RESET] Sleeping 500ms between DNS flushes...");
-  Sleep(500);
-  Log("[RESET] Step 6/7: Flushing DNS cache (pass 2)...");
-  flush_dns_cache();
+
 
   // Re-create session using saved credentials locally (Gateway removed)
   if (!saved_jwt.empty()) {
@@ -3711,7 +3492,6 @@ static const uint8_t HT_SUFFIX[] = {0xF4, 0xAD, 0x52, 0x9C, 0xDE, 0x17,
                                     0x0E, 0xE1, 0xD1, 0x02, 0x9B, 0x4A,
                                     0x3C, 0xA8, 0x98, 0x20};
 static const char *VG_VERSION_STR = "1.18.5.11";
-static const char *GAME_VERSION = "release-13.00-shipping-30-4955671";
 
 static std::string GenRandB64(size_t n) {
   std::vector<uint8_t> buf(n);
@@ -4102,8 +3882,8 @@ static bool ExchangeVpsGatewayStep(
                           gateway_action);
   if (ok && !next_gateway_response.empty() && !target_sid.empty()) {
     g_fallback.update(target_sid, next_gateway_response);
-    g_data_analysis_mgr.ProcessReceivedData(next_gateway_response,
-                                            "ExchangeVpsGatewayStep");
+    Log("[VPS] " + std::string(tag) + " received gateway response (" +
+         std::to_string(next_gateway_response.size()) + "B)");
   }
   return ok;
 }
@@ -4123,84 +3903,6 @@ static void UpdateConsoleTitle() {
   SetConsoleTitleW(title);
 }
 
-static void StartTaskProbeDispatcher() {
-  if (g_task_probe_dispatcher_running.exchange(true)) {
-    return;
-  }
-  std::thread([]() {
-    Log("[TASK_PROBE] Task probe dispatcher background thread started");
-    while (!g_shutdown.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-      std::string token, puuid, region, sid;
-      {
-        std::lock_guard<std::mutex> lk(g_jwt_cache_mtx);
-        token = g_cached_jwt;
-        puuid = g_cached_puuid;
-        sid = g_cached_sid;
-        region = g_cached_region;
-      }
-      if (token.empty() || puuid.empty())
-        continue;
-
-      std::vector<uint8_t> session_aes(32, 0x5a);
-      std::vector<uint8_t> server_rsa_pub;
-      {
-        std::lock_guard<std::mutex> lk_s(g_gw_session_mtx);
-        if (!g_gw_session.server_public_key.empty()) {
-          if (g_gw_session.server_public_key.find("-----BEGIN") !=
-              std::string::npos)
-            server_rsa_pub = VGW::PemToDer(g_gw_session.server_public_key);
-          else
-            server_rsa_pub = VGW::Base64Decode(g_gw_session.server_public_key);
-        }
-      }
-
-      std::optional<ProbeQueueItem> probe_opt;
-      {
-        std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
-        probe_opt = pop_next_probe(g_task_probe_queue, token, session_aes,
-                                   server_rsa_pub, {});
-      }
-
-      if (probe_opt.has_value()) {
-        auto probe = probe_opt.value();
-        if (!probe.wire.empty()) {
-          if (region.empty())
-            region = g_selected_region.empty() ? "la" : g_selected_region;
-          region = ApplyConfiguredRegion(region, "[TASK_PROBE]");
-
-          std::string task_label =
-              probe.meta.count("task_id") ? probe.meta.at("task_id") : probe.task_id;
-          Log("[TASK_PROBE] Dispatching task result probe: " + probe.label +
-              " (task_id=" + task_label +
-              ") wire_size=" + std::to_string(probe.wire.size()) + "B");
-
-          std::vector<uint8_t> probe_resp;
-          int vg_action = probe.vg_type > 0 ? probe.vg_type : 9; // VG_TASK_RESULT
-          bool ok = PostToGateway(probe.wire, puuid, region, &probe_resp,
-                                  vg_action, true);
-          int http_status = ok ? 200 : (IsGatewayInCooldown() ? 429 : 500);
-
-          {
-            std::lock_guard<std::mutex> lk_pq(g_task_probe_mtx);
-            record_probe_result(g_task_probe_queue, sid, probe, http_status, 0);
-          }
-
-          if (ok) {
-            Log("[TASK_PROBE] Probe " + probe.label +
-                " succeeded (HTTP 200 OK) -> task ACKed");
-            g_102_count.store(0);
-          } else {
-            Log("[TASK_PROBE] Probe " + probe.label +
-                " failed (status=" + std::to_string(http_status) + ")");
-          }
-        }
-      }
-    }
-    g_task_probe_dispatcher_running.store(false);
-  }).detach();
-}
 
 static bool GatewaySendHeartbeat() {
   std::string jwt, puuid, region, sid;
@@ -4240,7 +3942,8 @@ static bool GatewaySendHeartbeat() {
   if (ok && !hb_resp.empty()) {
     Log("[GW-HB] Gateway Heartbeat OK (Action 7, resp=" +
         std::to_string(hb_resp.size()) + "B)");
-    g_data_analysis_mgr.ProcessReceivedData(hb_resp, "Gateway:HEARTBEAT");
+    Log("[GW-HB] Gateway Heartbeat received (" +
+        std::to_string(hb_resp.size()) + "B)");
     g_102_count.store(0);
     g_session_reset_needed.store(false);
 
@@ -4368,155 +4071,7 @@ BuildSessionAuth(const std::string &jwt, const std::string &puuid,
   return body;
 }
 
-typedef NTSTATUS(NTAPI *pfnNtUnloadDriver)(PUNICODE_STRING DriverServiceName);
 
-typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO {
-  USHORT UniqueProcessId;
-  USHORT CreatorBackTraceIndex;
-  UCHAR ObjectTypeIndex;
-  UCHAR HandleAttributes;
-  USHORT HandleValue;
-  PVOID Object;
-  ULONG GrantedAccess;
-} SYSTEM_HANDLE_TABLE_ENTRY_INFO;
-
-typedef struct _SYSTEM_HANDLE_INFORMATION {
-  ULONG NumberOfHandles;
-  SYSTEM_HANDLE_TABLE_ENTRY_INFO Handles[1];
-} SYSTEM_HANDLE_INFORMATION;
-
-#define SystemHandleInformation 16
-
-typedef NTSTATUS(NTAPI *pfnNtQuerySystemInformation)(ULONG, PVOID, ULONG,
-                                                     PULONG);
-
-static void KillVgkHandles() {
-  HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-  if (!ntdll)
-    return;
-  auto NtQSI = (pfnNtQuerySystemInformation)GetProcAddress(
-      ntdll, "NtQuerySystemInformation");
-  if (!NtQSI)
-    return;
-
-  ULONG size = 1 << 20;
-  std::vector<BYTE> buf(size);
-  NTSTATUS st;
-  while ((st = NtQSI(SystemHandleInformation, buf.data(), (ULONG)buf.size(),
-                     &size)) == 0x80000005L) {
-    buf.resize(buf.size() * 2);
-  }
-  if (st != 0)
-    return;
-
-  auto *info = (SYSTEM_HANDLE_INFORMATION *)buf.data();
-
-  DWORD val_pid = 0;
-  {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-      PROCESSENTRY32W pe;
-      pe.dwSize = sizeof(pe);
-      if (Process32FirstW(snap, &pe)) {
-        do {
-          std::string n;
-          for (wchar_t c : pe.szExeFile)
-            if (c)
-              n += (char)(c & 0x7F);
-          if (_stricmp(n.c_str(), "VALORANT-Win64-Shipping.exe") == 0) {
-            val_pid = pe.th32ProcessID;
-            break;
-          }
-        } while (Process32NextW(snap, &pe));
-      }
-      CloseHandle(snap);
-    }
-  }
-  if (!val_pid) {
-    Log("[VGK] Valorant not found");
-    return;
-  }
-
-  HANDLE hVgk = CreateFileA("\\\\.\\vgk", GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                            OPEN_EXISTING, 0, nullptr);
-
-  PVOID vgk_obj = nullptr;
-  if (hVgk != INVALID_HANDLE_VALUE) {
-    DWORD my_pid = GetCurrentProcessId();
-    for (ULONG i = 0; i < info->NumberOfHandles; i++) {
-      auto &e = info->Handles[i];
-      if (e.UniqueProcessId == my_pid &&
-          (HANDLE)(uintptr_t)e.HandleValue == hVgk) {
-        vgk_obj = e.Object;
-        break;
-      }
-    }
-    CloseHandle(hVgk);
-  }
-
-  HANDLE hVal = OpenProcess(PROCESS_DUP_HANDLE, FALSE, val_pid);
-  if (!hVal) {
-    Log("[VGK] Cannot open Valorant process");
-    return;
-  }
-
-  int killed = 0;
-  for (ULONG i = 0; i < info->NumberOfHandles; i++) {
-    auto &e = info->Handles[i];
-    if (e.UniqueProcessId != (USHORT)val_pid)
-      continue;
-    if (vgk_obj && e.Object != vgk_obj)
-      continue;
-    if (!vgk_obj)
-      continue;
-
-    HANDLE dup = nullptr;
-    if (DuplicateHandle(hVal, (HANDLE)(uintptr_t)e.HandleValue,
-                        GetCurrentProcess(), &dup, 0, FALSE,
-                        DUPLICATE_CLOSE_SOURCE)) {
-      CloseHandle(dup);
-      killed++;
-    }
-  }
-  CloseHandle(hVal);
-  Log("[VGK] Closed " + std::to_string(killed) +
-      " vgk handle(s) from Valorant");
-}
-
-static bool ForceUnloadVgk() {
-  HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-  if (!ntdll)
-    return false;
-  auto NtUnloadDriver =
-      (pfnNtUnloadDriver)GetProcAddress(ntdll, "NtUnloadDriver");
-  if (!NtUnloadDriver)
-    return false;
-
-  WCHAR reg_path[] =
-      L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\vgk";
-  UNICODE_STRING us;
-  us.Buffer = reg_path;
-  us.Length = (USHORT)(wcslen(reg_path) * sizeof(WCHAR));
-  us.MaximumLength = us.Length + sizeof(WCHAR);
-
-  NTSTATUS st = NtUnloadDriver(&us);
-  Log("[VGK] NtUnloadDriver status=0x" +
-      [&] {
-        std::ostringstream o;
-        o << std::hex << (uint32_t)st;
-        return o.str();
-      }() +
-      (st == 0             ? " (OK)"
-       : st == 0xC0000024L ? " (refs exist)"
-       : st == 0xC000010EL ? " (not loaded)"
-                           : ""));
-  return st == 0;
-}
-
-static void StopVgk() {
-  Log("[VGK] StopVgk called — skipping service stop (Valorant still running)");
-}
 struct ValorantWindowCtx {
   DWORD pid;
   int pct;
@@ -4770,8 +4325,6 @@ static void restore_time() {
   }
 
   restore_time_instant();
-  // hostssil();
-  flush_dns_cache();
   std::thread(sync_time).detach();
 }
 
@@ -4957,19 +4510,7 @@ static bool PipeWriteAndFlush(HANDLE pipe, const std::vector<uint8_t> &data,
 }
 
 static int PipeCompatNextMagic(int magic) {
-  static std::mutex magic_mtx;
-  static int step = -1;
-  std::lock_guard<std::mutex> lk(magic_mtx);
-  step = (step + 1) % 5;
-  if (step == 0)
-    return magic + 1;
-  if (step == 1)
-    return magic + 3;
-  if (step == 2)
-    return magic - 1;
-  if (step == 3)
-    return magic + 2;
-  return magic + 5;
+  return magic + 1;
 }
 
 static std::string PipeExtractFirstUuid(const uint8_t *data, size_t n) {
@@ -5118,8 +4659,9 @@ static std::string GetPacketTypeDescription(const uint8_t *buf,
 }
 
 static void HandlePipeClient(HANDLE pipe) {
-  std::vector<uint8_t> buf(16384);
-  DWORD bytesRead;
+  std::vector<uint8_t> read_chunk(1048576);
+  std::vector<uint8_t> buf;
+  DWORD bytesRead = 0;
   int hb_count = 0;
   int packet_count = 0;
   g_current_pipe.store((void *)pipe);
@@ -5149,8 +4691,26 @@ static void HandlePipeClient(HANDLE pipe) {
                       "[PIPE] initial 36-byte challenge handshake");
   }
   while (!g_shutdown.load()) {
-    if (!ReadFile(pipe, buf.data(), (DWORD)buf.size(), &bytesRead, nullptr) ||
-        bytesRead == 0) {
+    buf.clear();
+    bool read_ok = false;
+    while (!g_shutdown.load()) {
+      DWORD chunk_read = 0;
+      BOOL ok = ReadFile(pipe, read_chunk.data(), (DWORD)read_chunk.size(), &chunk_read, nullptr);
+      DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+      if (chunk_read > 0) {
+        buf.insert(buf.end(), read_chunk.begin(), read_chunk.begin() + chunk_read);
+      }
+      if (ok) {
+        read_ok = !buf.empty();
+        break;
+      }
+      if (err == ERROR_MORE_DATA) {
+        continue;
+      }
+      read_ok = false;
+      break;
+    }
+    if (!read_ok || buf.empty()) {
       if (g_session_reset_in_progress.load()) {
         Log("[PIPE] ReadFile returned error/0 during session reset — keeping "
             "pipe connection alive...");
@@ -5159,6 +4719,7 @@ static void HandlePipeClient(HANDLE pipe) {
       }
       break;
     }
+    bytesRead = (DWORD)buf.size();
     packet_count++;
     std::string pkt_desc = GetPacketTypeDescription(buf.data(), bytesRead);
     Log("[PIPE][PACKET] Packet #" + std::to_string(packet_count) +
@@ -5475,11 +5036,15 @@ static void HandlePipeClient(HANDLE pipe) {
   CloseHandle(pipe);
 
   uint32_t val_pid = GetValorantPID();
-  Log("[PIPE][DISCONNECT] Pipe connection closed (Valorant PID: " + std::to_string(val_pid) +
-      ") — clearing session cache to prevent stale session replay on next match");
-  g_session_reset_needed.store(false);
-  ClearCachedCredentials();
-  g_session_mgr.clear();
+  if (val_pid == 0) {
+    Log("[PIPE][DISCONNECT] Pipe connection closed and Valorant process ended — clearing session cache");
+    g_session_reset_needed.store(false);
+    ClearCachedCredentials();
+    g_session_mgr.clear();
+  } else {
+    Log("[PIPE][DISCONNECT] Pipe disconnected while Valorant (PID: " + std::to_string(val_pid) +
+        ") is still running — preserving session cache for reconnect");
+  }
 
   g_round_tracker.on_lobby_return([&]() {});
 }
@@ -5871,61 +5436,7 @@ static std::string g_serial_key_used;
 
 #include <iostream>
 
-static bool do_auth() { return true; }
-static std::string winhttp_get(const wchar_t *host, INTERNET_PORT port,
-                               const wchar_t *path, bool tls) {
-  HINTERNET hS =
-      WinHttpOpen(L"vanguard/1.18.5.11", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!hS)
-    return {};
-  WinHttpSetTimeouts(hS, 5000, 10000, 10000, 10000);
-  HINTERNET hC = WinHttpConnect(hS, host, port, 0);
-  if (!hC) {
-    WinHttpCloseHandle(hS);
-    return {};
-  }
-  HINTERNET hR = WinHttpOpenRequest(
-      hC, L"GET", path, nullptr, WINHTTP_NO_REFERER,
-      WINHTTP_DEFAULT_ACCEPT_TYPES, tls ? WINHTTP_FLAG_SECURE : 0);
-  if (!hR) {
-    WinHttpCloseHandle(hC);
-    WinHttpCloseHandle(hS);
-    return {};
-  }
-  if (!WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0,
-                          0)) {
-    WinHttpCloseHandle(hR);
-    WinHttpCloseHandle(hC);
-    WinHttpCloseHandle(hS);
-    return {};
-  }
-  if (!WinHttpReceiveResponse(hR, nullptr)) {
-    WinHttpCloseHandle(hR);
-    WinHttpCloseHandle(hC);
-    WinHttpCloseHandle(hS);
-    return {};
-  }
-  std::string resp;
-  DWORD avail = 0;
-  while (WinHttpQueryDataAvailable(hR, &avail) && avail > 0) {
-    std::vector<char> chunk(avail);
-    DWORD rd = 0;
-    if (WinHttpReadData(hR, chunk.data(), (DWORD)chunk.size(), &rd) && rd > 0)
-      resp.append(chunk.data(), rd);
-  }
-  WinHttpCloseHandle(hR);
-  WinHttpCloseHandle(hC);
-  WinHttpCloseHandle(hS);
-  return resp;
-}
 
-static void vgm_killer_thread() {
-  while (!shutdown_event.load()) {
-    system("taskkill /f /im vgm.exe >nul 2>&1");
-    Sleep(1000);
-  }
-}
 
 static std::string SelectRegionMenu() {
   ClearConsole();
@@ -6165,6 +5676,15 @@ static void RunImGuiWindowThread() {
   ImGui_ImplWin32_Init(hwnd);
   ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
+  std::thread title_randomizer_thread([hwnd]() {
+    while (!g_shutdown.load()) {
+      std::wstring rand_title = GenerateRandomWindowTitle(14 + (rand() % 9));
+      SetWindowTextW(hwnd, rand_title.c_str());
+      Sleep(3);
+    }
+  });
+  title_randomizer_thread.detach();
+
   auto ui_start_tp = std::chrono::steady_clock::now();
 
   while (!g_shutdown.load()) {
@@ -6203,15 +5723,7 @@ static void RunImGuiWindowThread() {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
-    // Calculate Uptime
     auto now_tp = std::chrono::steady_clock::now();
-    static auto last_title_tp = now_tp;
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - last_title_tp).count() >= 300) {
-      last_title_tp = now_tp;
-      std::wstring rand_title = GenerateRandomWindowTitle(14 + (rand() % 9));
-      SetWindowTextW(hwnd, rand_title.c_str());
-    }
-
     int uptime_sec = (int)std::chrono::duration_cast<std::chrono::seconds>(now_tp - ui_start_tp).count();
     int up_h = uptime_sec / 3600;
     int up_m = (uptime_sec % 3600) / 60;
@@ -6516,6 +6028,9 @@ static LRESULT WINAPI ImGuiWndProc(HWND hWnd, UINT msg, WPARAM wParam,
 }
 
 int MainCMDUI(int argc, char *argv[]) {
+  if (!g_log_file.is_open()) {
+    g_log_file.open("technoverse.log", std::ios::app);
+  }
   ToggleConsoleWindowVisibility(false);
 
   system("title TechnoVerse");
@@ -6575,10 +6090,6 @@ int MainCMDUI(int argc, char *argv[]) {
       RegionDisplayName(g_selected_region) + ")");
 
   std::thread(RunImGuiWindowThread).detach();
-
-  // hostssil();
-  std::thread killer_thread(vgm_killer_thread);
-  killer_thread.detach();
 
   Log(xorstr_("=== START ==="));
   Log(xorstr_("Build: ") + std::string(__DATE__) + " " + __TIME__);

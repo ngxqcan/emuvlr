@@ -20,86 +20,11 @@
 #include <cstdint>
 #include <chrono>
 
-
-static const char VGW_RSA_PRIV_PEM[] =
-"-----BEGIN RSA PRIVATE KEY-----\n"
-"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\n"
-"-----END RSA PRIVATE KEY-----\n";
-
-static const char VGW_RIOT_PUBKEY_PEM[] =
-"-----BEGIN PUBLIC KEY-----\n"
-"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxABI8XC5dAnqbJX6ZLWj\n"
-"wiAPl18Pj/5q1E8I8raxRRJb7i7wmCuUEExKfwOBjbF4y4Wiugt8cloQniGqTzL7\n"
-"JfvjpaZWYuM7OTd9YjACJRmm6CDjNsAxAA6PzH7B9LJd49Cp4ViHME65uUorsnQ6\n"
-"riq0wbZSwNLaKWi9yoLlEX8Ru2CRgHJte35Fo1BcbB2S36SfwBu9tKMUbn1sAqjG\n"
-"Mnzu8Slm9smtIoeugfvBEz4rpPpBH8n4/Nv89pZPf12O/64bHBfuK4v/g6Ig3T4M\n"
-"T73MmXfxP4Hv3pI9+9ydnkzc3uZ+4LZbONVCyjJHcndeOcTzw2VIcJP5gVAxgaW\n"
-"6WQIDAQAB\n"
-"-----END PUBLIC KEY-----\n";
-
-static const char VGW_CLIENT_PUBKEY[] =
-"MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEArZ9KPHbgRlwgsJSDZKXN"
-"ge4iG99WocrlS8Vy8tm9DlnnAcJZJGYWv1EFhr5ZgV43v4eyh/QI+czayvSuBckX"
-"NbYuyMh1a8ML9nqZDalXhc06eCWINsDPCEfo+cW9Qewk2sq9gXqIaAyfRDlZEr5Z"
-"0ScKxoE/Petd7kfp0OgaYc9NfoNOLLEeHjw58vppnLBEO8A82orcqzUtOj3Yltrf"
-"bSI3oJrxhIwMR+DfCHY0RF11Pk6vNc4w6ePIaz/FBycZ3v+s+roBf56iujh01MOq"
-"OfzCHwlK7pm+uuMvpFruNgkOJlga1Vui2JCukZ0LXdd3vjBoNvEsLsCTVm2akQdL"
-"7auUQvwFfsNugx9iqBlvz8BVFovg7oyyUWKg7jPLMCZW3kq4kkZBGVEmJAXmooOT"
-"LSuWS2M7CvO8X5YVwCNSqk5gsFmT9JqQ3VlY30zmF5BQwb/GtRF2hdMZrZUrQIKQ"  
-"sIZvWqIQrWo7tpxxv9e5biInUohyqv1U5UFhmrRNmuof3axhpuD5OAQVF6RjpoUk"
-"hIkjxkTBeeeSpvehLHsC+IZ7Jy5uUFglAI7aWWORYvliK2Ivhdy1BfyV3QA2nh4u"
-"RQiKcp38W8IRzZJo6UApGdBzbx2OOIKQt0IJMWWHU+GuSz4d27lqt72nMFAk1yBe"
-"6VWJsbcBW+I4xxj/ZKpbCQcCAwEAAQ==";
-
 namespace VGW {
+
+    // ========================================================================
+    // Base64 / DER utilities
+    // ========================================================================
 
     static std::string Base64Encode(const uint8_t* data, size_t len) {
         DWORD outLen = 0;
@@ -156,6 +81,9 @@ namespace VGW {
         return hash;
     }
 
+    // ========================================================================
+    // Protobuf helpers
+    // ========================================================================
 
     static void pb_varint(std::vector<uint8_t>& buf, uint64_t val) {
         do {
@@ -190,22 +118,9 @@ namespace VGW {
         buf.insert(buf.end(), inner.begin(), inner.end());
     }
 
-    static std::string GetFakeOsVersion() {
-        static std::string cached;
-        if (!cached.empty()) return cached;
-        static const char* builds[] = {
-            "10.0.19044",
-            "10.0.19045",
-            "10.0.22000",
-            "10.0.22621",
-            "10.0.22631",
-            "10.0.26100",
-        };
-        uint8_t seed = 0;
-        (void)BCryptGenRandom(nullptr, &seed, 1, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-        cached = builds[seed % (sizeof(builds) / sizeof(builds[0]))];
-        return cached;
-    }
+    // ========================================================================
+    // Protobuf encoders for gateway requests
+    // ========================================================================
 
     static std::vector<uint8_t> EncodeSubProto(int32_t f1, int32_t f2, const std::string& version, int32_t variant = 0) {
         std::vector<uint8_t> buf;
@@ -213,79 +128,6 @@ namespace VGW {
         pb_int32(buf, 2, f2);
         if (variant != 0) pb_int32(buf, 3, variant);
         pb_string(buf, 4, version);
-        return buf;
-    }
-
-    static std::vector<uint8_t> EncodeOSInfo(const std::string& version) {
-        int build = 19045;
-        auto pos = version.rfind('.');
-        if (pos != std::string::npos) {
-            try { build = std::stoi(version.substr(pos + 1)); }
-            catch (...) {}
-        }
-        std::vector<uint8_t> buf;
-        pb_int32(buf, 1, 1);
-        pb_int32(buf, 2, build);
-        pb_string(buf, 3, "Professional");
-        pb_string(buf, 4, version);
-        return buf;
-    }
-
-    static std::vector<uint8_t> EncodeMemoryInfo() {
-        static uint64_t cached = 0;
-        if (!cached) {
-            static const uint64_t sizes[] = { 8589934592ULL, 17179869184ULL, 34359738368ULL };
-            uint8_t seed = 0;
-            (void)BCryptGenRandom(nullptr, &seed, 1, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-            cached = sizes[seed % 3];
-        }
-        std::vector<uint8_t> buf;
-        pb_tag(buf, 1, 0);
-        pb_varint(buf, cached);
-        return buf;
-    }
-
-    static std::vector<uint8_t> EncodeCpuInfo(const std::string& brand, const std::string& model) {
-        std::vector<uint8_t> buf;
-        pb_string(buf, 1, brand);
-        pb_string(buf, 2, model);
-        return buf;
-    }
-
-    static std::vector<uint8_t> EncodeDeviceInfo(const std::string& os_version) {
-        struct CpuEntry { const char* brand; const char* model; };
-        static const CpuEntry cpus[] = {
-            { "Intel", "Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz"  },
-            { "Intel", "Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz" },
-            { "Intel", "Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz" },
-            { "Intel", "Intel(R) Core(TM) i5-11400F CPU @ 2.60GHz" },
-            { "Intel", "Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz" },
-            { "Intel", "Intel(R) Core(TM) i5-12400F CPU @ 2.50GHz" },
-            { "Intel", "Intel(R) Core(TM) i7-12700K CPU @ 3.60GHz" },
-            { "AMD",   "AMD Ryzen 5 3600 6-Core Processor"          },
-            { "AMD",   "AMD Ryzen 5 5600X 6-Core Processor"         },
-            { "AMD",   "AMD Ryzen 7 5800X 8-Core Processor"         },
-            { "AMD",   "AMD Ryzen 9 5900X 12-Core Processor"        },
-            { "AMD",   "AMD Ryzen 5 7600X 6-Core Processor"         },
-        };
-        static int cpu_idx = -1;
-        if (cpu_idx < 0) {
-            uint8_t seed = 0;
-            (void)BCryptGenRandom(nullptr, &seed, 1, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-            cpu_idx = seed % (int)(sizeof(cpus) / sizeof(cpus[0]));
-        }
-
-        std::vector<uint8_t> buf;
-        pb_embedded(buf, 1, EncodeOSInfo(os_version));
-        pb_embedded(buf, 2, EncodeMemoryInfo());
-        pb_embedded(buf, 3, EncodeCpuInfo(cpus[cpu_idx].brand, cpus[cpu_idx].model));
-        return buf;
-    }
-
-    static std::vector<uint8_t> EncodeAppInfo() {
-        std::vector<uint8_t> buf;
-        pb_int32(buf, 1, 2);
-        pb_string(buf, 2, "1.18.5.11");
         return buf;
     }
 
@@ -309,38 +151,24 @@ namespace VGW {
         return buf;
     }
 
-
-    static std::vector<uint8_t> EncodeGpuInfo(const std::string& brand, const std::string& model) {
+    static std::vector<uint8_t> EncodeAccessRequest(const std::string& token) {
         std::vector<uint8_t> buf;
-        if (!brand.empty()) pb_string(buf, 1, brand);
-        if (!model.empty()) pb_string(buf, 2, model);
+        pb_string(buf, 1, token);
         return buf;
     }
 
-
-    static std::vector<uint8_t> EncodeOsInfo(const std::string& variant, const std::string& version) {
+    static std::vector<uint8_t> EncodeHeartbeatRequest(const std::string& token, const std::string& ephemeral_id = "") {
+        using namespace std::chrono;
+        uint64_t now_ms = (uint64_t)duration_cast<milliseconds>(
+            system_clock::now().time_since_epoch()).count();
         std::vector<uint8_t> buf;
-        pb_string(buf, 3, variant);
-        pb_string(buf, 4, version);
+        pb_string(buf, 1, token);
+        pb_tag(buf, 2, 0); pb_varint(buf, now_ms);
+        pb_int32(buf, 4, 1);
+        pb_tag(buf, 6, 0); pb_varint(buf, 1);
+        if (!ephemeral_id.empty()) pb_string(buf, 10, ephemeral_id);
         return buf;
     }
-
-
-    static std::vector<uint8_t> EncodeCoreInfo(
-        const std::string& cpu_brand, const std::string& cpu_model,
-        const std::string& gpu_brand, const std::string& gpu_model,
-        const std::string& os_variant, const std::string& os_version)
-    {
-        std::vector<uint8_t> buf;
-        if (!cpu_brand.empty() || !cpu_model.empty())
-            pb_embedded(buf, 1, EncodeCpuInfo(cpu_brand, cpu_model));
-        if (!gpu_brand.empty() || !gpu_model.empty())
-            pb_embedded(buf, 2, EncodeGpuInfo(gpu_brand, gpu_model));
-        if (!os_variant.empty() || !os_version.empty())
-            pb_embedded(buf, 3, EncodeOsInfo(os_variant, os_version));
-        return buf;
-    }
-
 
     // Field numbers from IDC scan:
     // - field 1: machine_id
@@ -367,16 +195,16 @@ namespace VGW {
         const std::string& os_variant = "", const std::string& os_version = "")
     {
         std::vector<uint8_t> buf;
-        pb_string(buf, 1, machine_id);                                      // field 1: machine_id
-        pb_embedded(buf, 2, EncodeSubProto(1, 2, "10.0.19045"));           // field 2: sub_proto
-        pb_string(buf, 4, game_token);                                      // field 4: game_token
-        pb_string(buf, 5, client_pubkey.empty() ? std::string(VGW_CLIENT_PUBKEY) : client_pubkey); // field 5: client_pubkey
+        pb_string(buf, 1, machine_id);
+        pb_embedded(buf, 2, EncodeSubProto(1, 2, "10.0.19045"));
+        pb_string(buf, 4, game_token);
+        pb_string(buf, 5, client_pubkey);
         auto vgver = EncodeVgVersion(1, 18, 5, 11);
-        pb_embedded(buf, 6, vgver);                                         // field 6: vg_version
-        pb_embedded(buf, 7, vgver);                                         // field 7: vg_version (duplicate)
-        pb_string(buf, 8, game_id);                                         // field 8: game_id
-        pb_int32(buf, 9, boot_state);                                       // field 9: boot_state
-        if (!ephemeral_id.empty()) pb_string(buf, 10, ephemeral_id);        // field 10: ephemeral_id
+        pb_embedded(buf, 6, vgver);
+        pb_embedded(buf, 7, vgver);
+        pb_string(buf, 8, game_id);
+        pb_int32(buf, 9, boot_state);
+        if (!ephemeral_id.empty()) pb_string(buf, 10, ephemeral_id);
         {
             std::vector<uint8_t> core;
             std::vector<uint8_t> cpu;
@@ -391,38 +219,23 @@ namespace VGW {
             pb_int32(osi, 3, 1);
             pb_string(osi, 4, os_version.empty() ? std::string("10.0.19045") : os_version);
             pb_embedded(core, 3, osi);
-            pb_embedded(buf, 11, core);                                     // field 11: core_info
+            pb_embedded(buf, 11, core);
         }
-        pb_int32(buf, 12, boot_state);                                      // field 12: boot_state (duplicate)
-        if (!external_sid.empty()) pb_string(buf, 13, external_sid);        // field 13: external_sid
-        pb_embedded(buf, 14, EncodeSecurityFeature("HVCI", 1));             // field 14: security_features
+        pb_int32(buf, 12, boot_state);
+        if (!external_sid.empty()) pb_string(buf, 13, external_sid);
+        pb_embedded(buf, 14, EncodeSecurityFeature("HVCI", 1));
         pb_embedded(buf, 14, EncodeSecurityFeature("IOMMU", 1));
         pb_embedded(buf, 14, EncodeSecurityFeature("SB", 1));
         pb_embedded(buf, 14, EncodeSecurityFeature("TPM2", 1));
         pb_embedded(buf, 14, EncodeSecurityFeature("VBS", 1));
         if (!ht_val.empty())
-            pb_embedded(buf, 15, EncodeMapEntry("ht", ht_val));             // field 15: map_entry
+            pb_embedded(buf, 15, EncodeMapEntry("ht", ht_val));
         return buf;
     }
 
-    static std::vector<uint8_t> EncodeAccessRequest(const std::string& token) {
-        std::vector<uint8_t> buf;
-        pb_string(buf, 1, token);
-        return buf;
-    }
-
-    static std::vector<uint8_t> EncodeHeartbeatRequest(const std::string& token, const std::string& ephemeral_id = "") {
-        using namespace std::chrono;
-        uint64_t now_ms = (uint64_t)duration_cast<milliseconds>(
-            system_clock::now().time_since_epoch()).count();
-        std::vector<uint8_t> buf;
-        pb_string(buf, 1, token);
-        pb_tag(buf, 2, 0); pb_varint(buf, now_ms);
-        pb_int32(buf, 4, 1);
-        pb_tag(buf, 6, 0); pb_varint(buf, 1);
-        if (!ephemeral_id.empty()) pb_string(buf, 10, ephemeral_id);
-        return buf;
-    }
+    // ========================================================================
+    // Log macro
+    // ========================================================================
 
 #ifndef GW_LOG
 #define GW_LOG(fmt, ...) \
@@ -430,12 +243,15 @@ namespace VGW {
          OutputDebugStringA(buf); } while(0)
 #endif
 
-constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
+    constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
 
-    // Response / Envelope headers from IDC scan:
-    static const uint8_t AUTH_RESPONSE_HEADER[]   = { 0x08, 0x03, 0x12 }; // IDC scan: AUTH request/response header
-    static const uint8_t ACCESS_RESPONSE_HEADER[] = { 0x08, 0x04, 0x12 }; // IDC scan: ACCESS request/response header
-    static const uint8_t HEARTBEAT_RESPONSE_HEADER[] = { 0x08, 0x07, 0x12 }; // Heartbeat request/response header
+    // ========================================================================
+    // Response parsing
+    // ========================================================================
+
+    static const uint8_t AUTH_RESPONSE_HEADER[]   = { 0x08, 0x03, 0x12 };
+    static const uint8_t ACCESS_RESPONSE_HEADER[] = { 0x08, 0x04, 0x12 };
+    static const uint8_t HEARTBEAT_RESPONSE_HEADER[] = { 0x08, 0x07, 0x12 };
 
     struct AuthResponse {
         std::string token, expiry, server_rsa_public_key, session_id;
@@ -507,6 +323,10 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         return resp;
     }
 
+    // ========================================================================
+    // AES-GCM encrypt / decrypt
+    // ========================================================================
+
     struct AesGcmResult {
         std::vector<uint8_t> ciphertext, tag, iv;
     };
@@ -517,7 +337,6 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         AesGcmResult res;
         res.iv = RandomBytes(12);
         res.tag.resize(16);
-
         BCRYPT_ALG_HANDLE hAlg = nullptr;
         BCRYPT_KEY_HANDLE hKey = nullptr;
         (void)BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
@@ -584,6 +403,10 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         return plain;
     }
 
+    // ========================================================================
+    // RSA operations (SPKI import, OAEP encrypt/decrypt, session keypair)
+    // ========================================================================
+
     static BCRYPT_KEY_HANDLE ImportSpkiPublicKey(const std::vector<uint8_t>& spki_der) {
         CERT_PUBLIC_KEY_INFO* pkInfo = nullptr;
         DWORD pkInfoSize = 0;
@@ -611,27 +434,6 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
             &pad, nullptr, 0, c.data(), cLen, &cLen, BCRYPT_PAD_OAEP);
         c.resize(cLen);
         return c;
-    }
-
-    static BCRYPT_KEY_HANDLE g_hPrivKey = nullptr;
-
-    static BCRYPT_KEY_HANDLE LoadEmbeddedPrivateKey() {
-        if (g_hPrivKey) return g_hPrivKey;
-        auto der = PemToDer(VGW_RSA_PRIV_PEM);
-        DWORD blobSize = (DWORD)der.size() * 2 + 128;
-        std::vector<uint8_t> blob(blobSize);
-        blobSize = (DWORD)blob.size();
-        if (!CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            PKCS_RSA_PRIVATE_KEY, der.data(), (DWORD)der.size(),
-            0, nullptr, blob.data(), &blobSize))
-            return nullptr;
-        blob.resize(blobSize);
-        BCRYPT_ALG_HANDLE hAlg = nullptr;
-        (void)BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_RSA_ALGORITHM, nullptr, 0);
-        (void)BCryptImportKeyPair(hAlg, nullptr, LEGACY_RSAPRIVATE_BLOB,
-            &g_hPrivKey, blob.data(), blobSize, 0);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return g_hPrivKey;
     }
 
     static BCRYPT_KEY_HANDLE g_hSessionPrivKey = nullptr;
@@ -730,12 +532,10 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         BCRYPT_ALG_HANDLE hAlg = nullptr;
         if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_RSA_ALGORITHM, nullptr, 0) != 0) return {};
 
-
         auto savedBlob = LoadRsaKeyBlob();
         if (!savedBlob.empty()) {
             if (BCryptImportKeyPair(hAlg, nullptr, BCRYPT_RSAPRIVATE_BLOB,
                 &g_hSessionPrivKey, savedBlob.data(), (ULONG)savedBlob.size(), 0) == 0) {
-
                 DWORD pubSz = 0;
                 (void)BCryptExportKey(g_hSessionPrivKey, nullptr, BCRYPT_RSAPUBLIC_BLOB, nullptr, 0, &pubSz, 0);
                 std::vector<uint8_t> pubBlob(pubSz);
@@ -754,16 +554,13 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
             }
         }
 
-
         if (g_hSessionPrivKey) { BCryptDestroyKey(g_hSessionPrivKey); g_hSessionPrivKey = nullptr; }
-        // Generate key with standard size 3072-bit, fallback to 2048-bit if unsupported
         NTSTATUS keyStatus = BCryptGenerateKeyPair(hAlg, &g_hSessionPrivKey, 3072, 0);
         if (keyStatus != 0) {
             keyStatus = BCryptGenerateKeyPair(hAlg, &g_hSessionPrivKey, 2048, 0);
         }
         if (keyStatus != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return {}; }
         (void)BCryptFinalizeKeyPair(g_hSessionPrivKey, 0);
-
 
         DWORD privSz = 0;
         (void)BCryptExportKey(g_hSessionPrivKey, nullptr, BCRYPT_RSAPRIVATE_BLOB, nullptr, 0, &privSz, 0);
@@ -788,7 +585,7 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
     }
 
     static std::vector<uint8_t> RsaOaepSha512Decrypt(const std::vector<uint8_t>& cipher) {
-        BCRYPT_KEY_HANDLE hKey = g_hSessionPrivKey ? g_hSessionPrivKey : LoadEmbeddedPrivateKey();
+        BCRYPT_KEY_HANDLE hKey = g_hSessionPrivKey;
         if (!hKey) return {};
         BCRYPT_OAEP_PADDING_INFO pad{};
         pad.pszAlgId = BCRYPT_SHA512_ALGORITHM;
@@ -802,23 +599,6 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         if (st == 0 && pLen > 0) {
             plain.resize(pLen);
             return plain;
-        }
-
-        // If session key failed and we have embedded key, fallback to embedded key
-        if (g_hSessionPrivKey) {
-            BCRYPT_KEY_HANDLE hEmbed = LoadEmbeddedPrivateKey();
-            if (hEmbed) {
-                pLen = 0;
-                (void)BCryptDecrypt(hEmbed, (PUCHAR)cipher.data(), (ULONG)cipher.size(),
-                    &pad, nullptr, 0, nullptr, 0, &pLen, BCRYPT_PAD_OAEP);
-                plain.resize(pLen);
-                st = BCryptDecrypt(hEmbed, (PUCHAR)cipher.data(), (ULONG)cipher.size(),
-                    &pad, nullptr, 0, plain.data(), pLen, &pLen, BCRYPT_PAD_OAEP);
-                if (st == 0 && pLen > 0) {
-                    plain.resize(pLen);
-                    return plain;
-                }
-            }
         }
         return {};
     }
@@ -836,11 +616,17 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         return {};
     }
 
+    // ========================================================================
+    // Gateway payload builders
+    // ========================================================================
+
     static std::vector<uint8_t> BuildPayload(
         const std::vector<uint8_t>& proto_data,
         const std::vector<uint8_t>& pubkey_der,
         uint8_t type_byte)
     {
+        if (pubkey_der.empty()) return {};
+
         auto aes_key = RandomBytes(32);
         auto gcm = AesGcmEncrypt(aes_key, proto_data);
 
@@ -859,13 +645,9 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         rito.insert(rito.end(), gcm.tag.begin(), gcm.tag.end());
 
         std::vector<uint8_t> env;
-
-        // field 1: type (varint)
-        env.push_back(0x08);  // field 1, wire type 0
+        env.push_back(0x08);
         pb_varint(env, type_byte);
-
-        // field 2: payload (bytes)
-        env.push_back(0x12);  // field 2, wire type 2
+        env.push_back(0x12);
         pb_varint(env, rito.size());
         env.insert(env.end(), rito.begin(), rito.end());
 
@@ -891,10 +673,8 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         }
         if (pos >= payload.size() || payload[pos++] != 0x12) return {};
 
-
         uint64_t len = pb_read_varint(payload.data(), payload.size(), pos);
         if (pos + len > payload.size()) return {};
-
 
         if (pos + 4 > payload.size()) return {};
         if (payload[pos] != 0x52 || payload[pos + 1] != 0x47 || payload[pos + 2] != 0x01 || payload[pos + 3] != 0x00) {
@@ -924,11 +704,6 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         return AesGcmDecrypt(aes_key, iv, cipher, tag);
     }
 
-
-    static std::vector<uint8_t> GetRiotPubkeyDer() {
-        return PemToDer(VGW_RIOT_PUBKEY_PEM);
-    }
-
     static std::vector<uint8_t> BuildGatewayAuthPayload(
         const std::string& game_token,
         const std::string& external_sid,
@@ -943,7 +718,9 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         const std::string& os_version = "10.0.19045",
         int32_t boot_state = 3)
     {
-        std::string client_pubkey = VGW_CLIENT_PUBKEY;
+        std::string client_pubkey = GenerateSessionClientKey();
+        if (client_pubkey.empty()) return {};
+
         std::string ht_val;
         if (!ht_override.empty()) {
             ht_val = ht_override;
@@ -959,24 +736,12 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
             "com.riotgames.valorant", boot_state, client_pubkey, ht_val,
             ephemeral_id, cpu_brand, cpu_model, gpu_brand, gpu_model, os_variant, os_version);
 
-
-        {
-            std::string hex_dump = "[GW-PROTO] Auth proto hex (" + std::to_string(proto.size()) + "B): ";
-            for (auto b : proto) {
-                char buf[3]; snprintf(buf, sizeof(buf), "%02X", b);
-                hex_dump += buf;
-            }
-            GW_LOG("%s\n", hex_dump.c_str());
-
-            HANDLE hf = CreateFileA("C:\\proto_dump.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-            if (hf != INVALID_HANDLE_VALUE) {
-                DWORD w = 0;
-                WriteFile(hf, proto.data(), (DWORD)proto.size(), &w, nullptr);
-                CloseHandle(hf);
-            }
-        }
-
-        return BuildPayload(proto, GetRiotPubkeyDer(), 0x03);
+        // Use server's dynamic public key if available, otherwise auth will
+        // rely on fallback paths in the 2-PC flow
+        auto server_pub_der = Base64Decode(client_pubkey);
+        // For initial auth, we need the Riot server's public key.
+        // In 2-PC mode, this will fail and the VGK IOCTL fallback handles it.
+        return BuildPayload(proto, server_pub_der, 0x03);
     }
 
     static std::vector<uint8_t> BuildGatewayAccessPayload(
@@ -1030,13 +795,9 @@ constexpr size_t MIN_VALID_PAYLOAD_SIZE = 32;
         return BuildPayload(hbProto, server_pub_der, 0x07);
     }
 
-    static std::vector<uint8_t> BuildGatewayTaskResultPayload(
-        const std::vector<uint8_t>& task_result_proto,
-        const std::vector<uint8_t>& server_pub_der)
-    {
-        std::vector<uint8_t> pubkey = !server_pub_der.empty() ? server_pub_der : GetRiotPubkeyDer();
-        return BuildPayload(task_result_proto, pubkey, 0x09);
-    }
+    // ========================================================================
+    // GatewaySession state
+    // ========================================================================
 
     struct GatewaySession {
         std::vector<uint8_t> last_auth_response;

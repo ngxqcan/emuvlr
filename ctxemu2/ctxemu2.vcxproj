@@ -154,27 +154,9 @@
     <ClCompile Include="imgui\imgui_tables.cpp" />
     <ClCompile Include="imgui\imgui_impl_win32.cpp" />
     <ClCompile Include="imgui\imgui_impl_dx11.cpp" />
-    <ClCompile Include="modules\hb_parse.cpp" />
-    <ClCompile Include="modules\hb_task_catalog.cpp" />
-    <ClCompile Include="modules\module_loader.cpp" />
-    <ClCompile Include="modules\task_analysis.cpp" />
-    <ClCompile Include="modules\task_payload_builder.cpp" />
-    <ClCompile Include="modules\task_probe_matrix.cpp" />
-    <ClCompile Include="modules\task_result_variants.cpp" />
-    <ClCompile Include="modules\vg_crypto.cpp" />
-    <ClCompile Include="modules\vg_http.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="vanguard_gateway.h" />
-    <ClInclude Include="modules\hb_parse.hpp" />
-    <ClInclude Include="modules\hb_task_catalog.hpp" />
-    <ClInclude Include="modules\module_loader.hpp" />
-    <ClInclude Include="modules\task_analysis.hpp" />
-    <ClInclude Include="modules\task_payload_builder.hpp" />
-    <ClInclude Include="modules\task_probe_matrix.hpp" />
-    <ClInclude Include="modules\task_result_variants.hpp" />
-    <ClInclude Include="modules\vg_crypto.hpp" />
-    <ClInclude Include="modules\vg_http.hpp" />
+    <ClInclude Include="vgw_core.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
